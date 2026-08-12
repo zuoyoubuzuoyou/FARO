@@ -1,0 +1,57 @@
+# @package _global_
+
+defaults:
+  - social_rearrange: pop_play
+  - hitl_defaults
+  - _self_
+
+habitat:
+  # todo: document these choices
+  environment:
+    max_episode_steps: 0
+    iterator_options:
+      cycle: False
+  task:
+    measurements:
+      pddl_success:
+        must_call_stop: False
+
+habitat_baselines:
+  # todo: document these choices
+  eval:
+    should_load_ckpt: False
+  rl:
+    agent:
+      num_pool_agents_per_type: [1,1]
+
+habitat_hitl:
+  window:
+    title: "Rearrange"
+    width: 1300
+    height: 1000
+  gui_controlled_agents:
+    - agent_index: 0
+      lin_speed: 10.0
+      ang_speed: 300
+  data_collection:
+    save_filepath_base: "my_session"
+    save_gfx_replay_keyframes: True
+    save_episode_record: True
+  hide_humanoid_in_gui: True
+  camera:
+    first_person_mode: True
+  # experimental:
+  #   # Choose between classic and batch renderer. This is an experimental feature aimed at those of us building the batch renderer.
+  #   use_batch_renderer: False
+  #   headless:
+  #     # Run without a GUI window. For unit-testing or use with networking.enable as a headless server.
+  #     do_headless: True
+  #     # Shortly after app startup, write debug images from the first K steps to video files. See debug_third_person_viewport and debug_images.
+  #     debug_video_writer:
+  #       num_frames_to_save: 30
+  #       filepath_base: "./debug_video"
+  #     # force app exit after K steps
+  #     exit_after: ~
+rearrange:
+  # Shows an intro sequence before the first episode that helps familiarize the user to task in a HITL context.
+  show_tutorial: False

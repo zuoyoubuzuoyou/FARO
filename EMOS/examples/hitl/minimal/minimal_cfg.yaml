@@ -1,0 +1,27 @@
+# minimal_cfg.yaml
+
+# For more info about Hydra in Habitat, see habitat-lab/habitat/config/README.md
+# @package _global_
+
+defaults:
+  # We load the `pop_play` Habitat baseline featuring a Spot robot
+  # and a humanoid in HSSD scenes. See habitat-baselines/README.md.
+  - social_rearrange: pop_play
+  # Load default parameters for the HITL framework. See
+  # habitat-hitl/habitat_hitl/config/hitl_defaults.yaml.
+  - hitl_defaults
+  - _self_
+# habitat_hitl:
+#   window:
+#   experimental:
+#     # Choose between classic and batch renderer. This is an experimental feature aimed at those of us building the batch renderer.
+#     use_batch_renderer: False
+#     headless:
+#       # Run without a GUI window. For unit-testing or use with networking.enable as a headless server.
+#       do_headless: True
+#       # Shortly after app startup, write debug images from the first K steps to video files. See debug_third_person_viewport and debug_images.
+#       debug_video_writer:
+#         num_frames_to_save: 30
+#         filepath_base: "./debug_video"
+#       # force app exit after K steps
+#       exit_after: ~

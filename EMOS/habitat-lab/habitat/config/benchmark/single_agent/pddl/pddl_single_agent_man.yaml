@@ -1,0 +1,30 @@
+# single agent manipualtion
+objects:
+  - name: any_targets|0
+    expr_type: movable_entity_type
+  - name: TARGET_any_targets|0
+    expr_type: goal_entity_type
+  - name: agent_0
+    expr_type: robot_entity_type
+
+goal:
+  expr_type: AND
+  sub_exprs:
+    - at(any_targets|0,TARGET_any_targets|0)
+    - not_holding(agent_0)
+
+stage_goals:
+  stage_1:
+    expr_type: AND
+    sub_exprs:
+      - robot_at(any_targets|0, agent_0)
+      - holding(any_targets|0, agent_0)
+
+solution:
+  - reset_arm(agent_0)
+  - nav_to_goal(any_targets|0, agent_0)
+  - pick(any_targets|0, agent_0)
+  - reset_arm(agent_0)
+  - nav_to_obj(TARGET_any_targets|0, agent_0)
+  - place(any_targets|0,TARGET_any_targets|0, agent_0)
+  - reset_arm(agent_0)
