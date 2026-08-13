@@ -1,0 +1,6 @@
+{
+  "files.watcherExclude": {
+    "**/partnr-planner/data/**": true,
+    "**/EMOS/data/**": true
+  }
+}
