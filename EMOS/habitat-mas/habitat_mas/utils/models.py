@@ -15,6 +15,13 @@ class QwenActionProtocolError(RuntimeError):
     pass
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, BaseModel):
@@ -45,6 +52,13 @@ class OpenAIModel:
         self.chat_history = []
         self.window_size = window_size
         self.backend = get_llm_backend()
+        if self.backend == "qwen":
+            self.qwen_planning_max_tokens = _positive_int_env(
+                "EMOS_QWEN_PLANNING_MAX_TOKENS", 1024
+            )
+            self.qwen_action_max_tokens = _positive_int_env(
+                "EMOS_QWEN_ACTION_MAX_TOKENS", 256
+            )
         configured_model = os.getenv("EMOS_LLM_MODEL", "").strip()
         self.model = configured_model or model
         print(
@@ -126,17 +140,12 @@ class OpenAIModel:
             if self.backend == "qwen" and self.code_execution:
                 return self._chat_qwen_planning(request)
             while True:
+                request_kwargs = {"messages": request, "model": self.model}
                 if self.tool_calls_enable:
-                    response = self.client.chat.completions.create(
-                        messages=request,  # type: ignore
-                        model=self.model,
-                        tools=self.openai_tools,
-                    )
-                else:
-                    response = self.client.chat.completions.create(
-                        messages=request,  # type: ignore
-                        model=self.model,
-                    )
+                    request_kwargs["tools"] = self.openai_tools
+                if self.backend == "qwen":
+                    request_kwargs["max_tokens"] = self.qwen_planning_max_tokens
+                response = self.client.chat.completions.create(**request_kwargs)
                 self.token_usage += response.usage.total_tokens
 
                 response_message = response.choices[0].message
@@ -188,10 +197,10 @@ class OpenAIModel:
                     return response_message.content
         elif crab_planning:
             while True:
-                response = self.client.chat.completions.create(
-                    messages=request,  # type: ignore
-                    model=self.model,
-                )
+                request_kwargs = {"messages": request, "model": self.model}
+                if self.backend == "qwen":
+                    request_kwargs["max_tokens"] = self.qwen_planning_max_tokens
+                response = self.client.chat.completions.create(**request_kwargs)
                 self.token_usage += response.usage.total_tokens
 
                 response_message = response.choices[0].message
@@ -253,7 +262,11 @@ class OpenAIModel:
     def _chat_qwen_planning(self, request):
         code_attempts = 0
         while True:
-            request_kwargs = {"messages": list(request), "model": self.model}
+            request_kwargs = {
+                "messages": list(request),
+                "model": self.model,
+                "max_tokens": self.qwen_planning_max_tokens,
+            }
             if self.tool_calls_enable:
                 request_kwargs["tools"] = self.openai_tools
             response = self.client.chat.completions.create(**request_kwargs)
@@ -340,6 +353,7 @@ class OpenAIModel:
                     for action in self.actions
                 ],
                 tool_choice="required",
+                max_tokens=self.qwen_action_max_tokens,
             )
             self.token_usage += response.usage.total_tokens
             response_message = response.choices[0].message

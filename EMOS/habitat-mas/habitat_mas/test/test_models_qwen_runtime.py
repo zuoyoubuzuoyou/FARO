@@ -185,6 +185,32 @@ def test_qwen_action_retry_exhaustion_raises_diagnostic(monkeypatch):
     assert create.call_count == 3
 
 
+def test_qwen_planning_request_has_configurable_output_limit(monkeypatch):
+    monkeypatch.setenv("EMOS_LLM_BACKEND", "qwen")
+    monkeypatch.setenv("EMOS_QWEN_PLANNING_MAX_TOKENS", "321")
+    model, create = make_model(
+        monkeypatch,
+        [completion("{{yes}}")],
+        planning=True,
+    )
+
+    assert model.chat("plan") == "{{yes}}"
+    assert create.call_args.kwargs["max_tokens"] == 321
+
+
+def test_qwen_action_request_has_configurable_output_limit(monkeypatch):
+    monkeypatch.setenv("EMOS_LLM_BACKEND", "qwen")
+    monkeypatch.setenv("EMOS_QWEN_ACTION_MAX_TOKENS", "77")
+    model, create = make_model(
+        monkeypatch,
+        [completion(tool_calls=[tool_call("wait", "{}")])],
+        actions=[FakeAction("wait")],
+    )
+
+    assert model.chat("act") == ("wait", {})
+    assert create.call_args.kwargs["max_tokens"] == 77
+
+
 def test_qwen_multiple_tool_calls_are_retried(monkeypatch):
     monkeypatch.setenv("EMOS_LLM_BACKEND", "qwen")
     model, create = make_model(
@@ -235,13 +261,14 @@ def test_qwen_semantic_validator_retries_premature_wait(monkeypatch):
 
 def test_gpt_normal_action_response_is_unchanged(monkeypatch):
     monkeypatch.setenv("EMOS_LLM_BACKEND", "gpt")
-    model, _ = make_model(
+    model, create = make_model(
         monkeypatch,
         [completion(tool_calls=[tool_call("pick", '{"target_obj": "cup"}')])],
         actions=[FakeAction("pick")],
     )
 
     assert model.chat("act") == ("pick", {"target_obj": "cup"})
+    assert "max_tokens" not in create.call_args.kwargs
 
 
 def test_gpt_numerical_execution_still_uses_legacy_interpreter(monkeypatch):
