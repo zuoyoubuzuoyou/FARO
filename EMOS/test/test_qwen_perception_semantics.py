@@ -40,6 +40,7 @@ def test_assignment_contract_identifies_real_agents_and_goal_vocabulary():
     assert "any_targets|1, any_targets|0" in contract
     assert "TARGET_any_targets" in contract
     assert "do not invent" in contract.lower()
+    assert "do not leave" in contract.lower()
 
 
 @pytest.mark.parametrize(
@@ -59,6 +60,11 @@ def test_assignment_contract_identifies_real_agents_and_goal_vocabulary():
         (
             "{agent_0||Nothing to do}{agent_1||Nothing to do}",
             "uncovered goal objects",
+        ),
+        (
+            "{agent_0||Detect any_targets|0 and any_targets|1}"
+            "{agent_1||Nothing to do}",
+            "idle agents",
         ),
         (
             "{agent_0||Detect any_targets|0}"
