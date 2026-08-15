@@ -65,6 +65,12 @@ class CrabAgent:
         self.scene_description = scene_description
         self.peer_ids = tuple(peer_ids)
         self.assigned_targets = set(OBJECT_ID_RE.findall(subtask_description))
+        self.goal_targets = {
+            target
+            for target in OBJECT_ID_RE.findall(task_description)
+            if not target.startswith("TARGET_")
+        }
+        self.delegated_targets: set[str] = set()
         self.completed_targets: set[str] = set()
         # create system message
         system_message = ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE.format(
@@ -81,6 +87,8 @@ class CrabAgent:
                 "Scene description:\n"
                 f'"""\n{scene_description}\n"""\n'
                 f"Valid peer agents: {peers}. "
+                "A request from a valid peer may temporarily authorize an "
+                "explicit global detection goal named in that request. "
                 "Return exactly one function call per action step. "
                 "Use wait only when your assigned subtask is Nothing to do or "
                 "all targets assigned to you have been completed."
@@ -144,6 +152,15 @@ class CrabAgent:
             self.completed_targets = set(completed_targets)
         if self.name in CrabAgent.message_pipe and CrabAgent.message_pipe[self.name]:
             prompt = " ".join(CrabAgent.message_pipe[self.name])
+            if get_llm_backend() == "qwen":
+                requested_targets = set(OBJECT_ID_RE.findall(prompt))
+                delegated_targets = requested_targets & self.goal_targets
+                self.delegated_targets.update(delegated_targets)
+                if delegated_targets:
+                    print(
+                        "Qwen delegated targets: "
+                        f"{tuple(sorted(self.delegated_targets))}"
+                    )
             observation = str(observation) + " " + prompt
             CrabAgent.message_pipe[self.name] = []
 
@@ -198,16 +215,19 @@ class CrabAgent:
                 )
         elif action_name == "nav_to_obj":
             target_obj = parameters.get("target_obj")
-            if target_obj not in self.assigned_targets:
+            allowed_targets = self.assigned_targets | self.delegated_targets
+            if target_obj not in allowed_targets:
                 return (
-                    f"target_obj {target_obj!r} is not in the assigned subtask; "
-                    f"choose one of {sorted(self.assigned_targets)}"
+                    f"target_obj {target_obj!r} is not in the assigned subtask or delegated goals; "
+                    f"choose one of {sorted(allowed_targets)}"
                 )
         elif action_name == "wait":
             nothing_to_do = (
                 self.subtask_description.strip().lower() == "nothing to do"
             )
-            unfinished = self.assigned_targets - self.completed_targets
+            unfinished = (
+                self.assigned_targets | self.delegated_targets
+            ) - self.completed_targets
             if not nothing_to_do and unfinished:
                 return f"assigned targets are unfinished: {sorted(unfinished)}"
         return None

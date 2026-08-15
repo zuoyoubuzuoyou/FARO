@@ -285,7 +285,13 @@ def test_qwen_never_executes_a_fourth_code_block(monkeypatch):
     assert model.interpreter.run_python_detailed.call_count == 3
 
 
-def make_crab_agent(monkeypatch, backend, subtask, chat_history=None):
+def make_crab_agent(
+    monkeypatch,
+    backend,
+    subtask,
+    chat_history=None,
+    task_description="Detect any_targets|0",
+):
     monkeypatch.setattr(models.OpenAIModel, "save_chat_history", lambda self, path: None)
     monkeypatch.setenv("EMOS_LLM_BACKEND", backend)
     create = Mock(return_value=completion("1. nav_to_obj(any_targets|0)"))
@@ -296,7 +302,7 @@ def make_crab_agent(monkeypatch, backend, subtask, chat_history=None):
     agent = CrabAgent("agent_0", [send_request, nav_to_obj, wait])
     agent.init_agent(
         "SpotRobot",
-        "Detect any_targets|0",
+        task_description,
         subtask,
         chat_history=chat_history,
         scene_description="scene description",
@@ -372,3 +378,27 @@ def test_qwen_issued_navigation_does_not_mark_detection_complete(monkeypatch):
         "arguments": {"target_obj": "any_targets|0", "robot": "agent_0"},
     }
     assert agent.completed_targets == set()
+
+
+def test_qwen_real_peer_request_temporarily_authorizes_explicit_goal(monkeypatch):
+    CrabAgent.message_pipe = {
+        "agent_0": [
+            '"agent_1" agent sent you requests: "Detect object any_targets|1".'
+        ]
+    }
+    agent = make_crab_agent(
+        monkeypatch,
+        "qwen",
+        "Detect any_targets|0",
+        task_description="Detect any_targets|0 and any_targets|1",
+    )
+    agent.llm_model.chat = Mock(
+        return_value=("nav_to_obj", {"target_obj": "any_targets|1"})
+    )
+
+    agent.chat("step", completed_targets=("any_targets|0",))
+
+    assert agent.delegated_targets == {"any_targets|1"}
+    assert agent._validate_qwen_action(
+        "nav_to_obj", {"target_obj": "any_targets|1"}
+    ) is None
