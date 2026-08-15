@@ -41,7 +41,7 @@ def build_assignment_contract(
         " Qwen assignment contract: The only valid agent IDs are: "
         f"{', '.join(robot_ids)}. The only objects required by the explicit "
         f"goal conditions are: {', '.join(goal_objects)}. Assign every required "
-        "object to at least one valid agent. When there are at least as many "
+        "object to exactly one valid agent. When there are at least as many "
         "required objects as valid agents, do not leave any valid agent without "
         "at least one required object. TARGET_any_targets|* identifiers are "
         "rearrangement destination markers, not implicit detection goals. Do not "
@@ -111,6 +111,21 @@ def validate_assignment(
         if subtask.strip().lower() == "nothing to do":
             continue
         assigned_objects.extend(extract_object_ids(subtask))
+
+    goal_assignment_counts = Counter(
+        object_id
+        for object_id in assigned_objects
+        if object_id in valid_goal_objects
+    )
+    duplicated_goals = tuple(
+        object_id
+        for object_id in goal_objects
+        if goal_assignment_counts[object_id] > 1
+    )
+    if duplicated_goals:
+        violations.append(
+            "duplicate goal assignments: " + ", ".join(duplicated_goals)
+        )
 
     irrelevant_objects = _unique(
         object_id
