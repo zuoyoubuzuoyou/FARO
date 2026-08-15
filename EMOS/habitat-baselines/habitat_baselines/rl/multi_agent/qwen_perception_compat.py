@@ -11,6 +11,10 @@ DETECTION_GOAL_RE = re.compile(
 )
 OBJECT_ID_RE = re.compile(r"(?:TARGET_)?any_targets\|\d+")
 ASSIGNMENT_RE = re.compile(r"\{([^{}|]+)\|\|([^{}]*)\}")
+BARE_ASSIGNMENT_RE = re.compile(
+    r"^\s*([^{}\n|]+?)\s*\|\|\s*([^{}\n]*?)\s*$",
+    re.MULTILINE,
+)
 
 
 class QwenAssignmentValidationError(ValueError):
@@ -33,6 +37,16 @@ def extract_object_ids(text: str) -> tuple[str, ...]:
     return _unique(OBJECT_ID_RE.findall(text))
 
 
+def _assignment_entries(text: str) -> list[tuple[str, str]]:
+    entries = ASSIGNMENT_RE.findall(text)
+    unbraced_text = ASSIGNMENT_RE.sub("", text)
+    entries.extend(BARE_ASSIGNMENT_RE.findall(unbraced_text))
+    return [
+        (robot_id.strip(), subtask.strip())
+        for robot_id, subtask in entries
+    ]
+
+
 def build_assignment_contract(
     robot_ids: tuple[str, ...],
     goal_objects: tuple[str, ...],
@@ -52,8 +66,8 @@ def build_assignment_contract(
 
 def parse_qwen_assignment(text: str) -> dict[str, str]:
     return {
-        robot_id.strip(): subtask.strip()
-        for robot_id, subtask in ASSIGNMENT_RE.findall(text)
+        robot_id: subtask
+        for robot_id, subtask in _assignment_entries(text)
     }
 
 
@@ -63,10 +77,7 @@ def validate_assignment(
     robot_ids: tuple[str, ...],
     goal_objects: tuple[str, ...],
 ) -> tuple[str, ...]:
-    entries = [
-        (robot_id.strip(), subtask.strip())
-        for robot_id, subtask in ASSIGNMENT_RE.findall(text)
-    ]
+    entries = _assignment_entries(text)
     entry_counts = Counter(robot_id for robot_id, _ in entries)
     valid_robot_ids = set(robot_ids)
     valid_goal_objects = set(goal_objects)

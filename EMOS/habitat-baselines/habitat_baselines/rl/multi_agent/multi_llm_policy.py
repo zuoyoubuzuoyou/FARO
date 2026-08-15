@@ -244,6 +244,7 @@ def request_qwen_assignment(
     last_violations = ()
     for attempt in range(max_attempts):
         response = leader.chat(prompt)
+        print(f"Qwen assignment attempt {attempt + 1}: {response!r}")
         tasks = parse_qwen_assignment(response)
         violations = validate_assignment(
             response,
@@ -253,6 +254,7 @@ def request_qwen_assignment(
         )
         if not violations:
             return response, tasks
+        print(f"Qwen assignment violations: {violations}")
         last_violations = violations
         if attempt + 1 < max_attempts:
             prompt = build_assignment_correction(
