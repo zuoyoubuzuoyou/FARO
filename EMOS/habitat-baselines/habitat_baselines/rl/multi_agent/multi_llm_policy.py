@@ -22,6 +22,7 @@ from habitat_baselines.rl.multi_agent.qwen_perception_compat import (
     build_assignment_correction,
     extract_detection_goal_objects,
     parse_qwen_assignment,
+    validate_qwen_perception_config,
     validate_assignment,
 )
 
@@ -657,6 +658,24 @@ class MultiLLMPolicy(MultiPolicy):
             env_text_context = envs_text_context[i]
             # if no previous actions, then it is the first step of the episode
             if not env_prev_actions.any():
+                if get_llm_backend() == "qwen":
+                    goal_objects = extract_detection_goal_objects(text_goal)
+                    if goal_objects:
+                        config_name = HydraConfig.get().job.config_name
+                        exposed_actions = {
+                            f"agent_{agent_i}": tuple(
+                                action.name
+                                for action in policy._high_level_policy.llm_agent.actions
+                            )
+                            for agent_i, policy in enumerate(self._active_policies)
+                        }
+                        print(
+                            "Qwen perception config guard: "
+                            f"config={config_name}; actions={exposed_actions}"
+                        )
+                        validate_qwen_perception_config(
+                            config_name, goal_objects, exposed_actions
+                        )
                 if "robot_resume" in env_text_context:
                     robot_resume = env_text_context["robot_resume"]
                 if "scene_description" in env_text_context:

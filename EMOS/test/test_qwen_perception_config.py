@@ -33,3 +33,17 @@ def test_qwen_overlay_removes_only_spot_manipulation_skills():
         qwen.habitat_baselines.rl.policy.agent_1, resolve=True
     )
     assert qwen_drone == base_drone
+
+
+def test_qwen_resolved_config_diff_is_only_spot_ignore_skills():
+    base = OmegaConf.to_container(get_config(BASE_CONFIG), resolve=True)
+    qwen = OmegaConf.to_container(get_config(QWEN_CONFIG), resolve=True)
+
+    base_ignore = base["habitat_baselines"]["rl"]["policy"]["agent_0"][
+        "hierarchical_policy"
+    ]["ignore_skills"]
+    qwen["habitat_baselines"]["rl"]["policy"]["agent_0"][
+        "hierarchical_policy"
+    ]["ignore_skills"] = base_ignore
+
+    assert qwen == base

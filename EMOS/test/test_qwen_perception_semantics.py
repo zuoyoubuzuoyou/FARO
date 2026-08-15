@@ -4,10 +4,12 @@ import pytest
 
 from habitat_baselines.rl.multi_agent.qwen_perception_compat import (
     QwenAssignmentValidationError,
+    QwenPerceptionConfigError,
     build_assignment_contract,
     extract_detection_goal_objects,
     parse_qwen_assignment,
     validate_assignment,
+    validate_qwen_perception_config,
 )
 from habitat_baselines.rl.multi_agent.multi_llm_policy import (
     request_qwen_assignment,
@@ -154,3 +156,25 @@ def test_qwen_leader_exhaustion_never_synthesizes_assignment():
         )
 
     assert leader.chat.call_count == 3
+
+
+def test_qwen_perception_base_config_fails_fast():
+    with pytest.raises(
+        QwenPerceptionConfigError, match="llm_spot_drone_per_qwen"
+    ):
+        validate_qwen_perception_config(
+            "multi_rearrange/llm_spot_drone_per",
+            ("any_targets|0",),
+            {"agent_0": ("nav_to_obj", "pick", "place", "wait")},
+        )
+
+
+def test_qwen_overlay_perception_actions_are_accepted():
+    validate_qwen_perception_config(
+        "multi_rearrange/llm_spot_drone_per_qwen",
+        ("any_targets|0",),
+        {
+            "agent_0": ("send_request", "nav_to_obj", "wait"),
+            "agent_1": ("send_request", "nav_to_obj", "wait"),
+        },
+    )

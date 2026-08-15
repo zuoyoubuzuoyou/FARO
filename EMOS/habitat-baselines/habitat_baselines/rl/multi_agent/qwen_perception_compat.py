@@ -17,6 +17,10 @@ class QwenAssignmentValidationError(ValueError):
     pass
 
 
+class QwenPerceptionConfigError(ValueError):
+    pass
+
+
 def _unique(items):
     return tuple(dict.fromkeys(items))
 
@@ -128,3 +132,32 @@ def build_assignment_correction(
         + "\nReturn a corrected assignment in the required format. Decide the "
         "agent-to-object mapping yourself."
     )
+
+
+def validate_qwen_perception_config(
+    config_name: str,
+    goal_objects: tuple[str, ...],
+    exposed_actions: dict[str, tuple[str, ...]],
+) -> None:
+    if not goal_objects:
+        return
+
+    forbidden_actions = {"pick", "place", "reset_arm"}
+    exposed_forbidden = {
+        agent_id: tuple(
+            action for action in actions if action in forbidden_actions
+        )
+        for agent_id, actions in exposed_actions.items()
+    }
+    exposed_forbidden = {
+        agent_id: actions
+        for agent_id, actions in exposed_forbidden.items()
+        if actions
+    }
+    if exposed_forbidden:
+        required = "multi_rearrange/llm_spot_drone_per_qwen.yaml"
+        raise QwenPerceptionConfigError(
+            "Qwen detection-only run exposes manipulation actions "
+            f"{exposed_forbidden} under config {config_name!r}. "
+            f"Use --config-name={required}."
+        )
