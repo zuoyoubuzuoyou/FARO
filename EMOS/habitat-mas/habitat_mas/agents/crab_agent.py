@@ -1,10 +1,13 @@
+import re
 from typing import List, Optional
 
 from .crab_core import Action
-from ..utils.models import OpenAIModel
+from ..utils.llm_backend import get_llm_backend
+from ..utils.models import OpenAIModel, QwenActionProtocolError
 
 
 REQUEST_TEMPLATE = '"{source_agent}" agent sent you requests: "{request}".'
+OBJECT_ID_RE = re.compile(r"(?:TARGET_)?any_targets\|\d+")
 
 ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE = (
     'You are a "{robot_type}" agent called "{robot_key}".'
@@ -50,6 +53,8 @@ class CrabAgent:
         task_description: str,
         subtask_description: str,
         chat_history: Optional[List] = None,
+        scene_description: str = "",
+        peer_ids: tuple[str, ...] = (),
         enable_logging: bool = False,
         logging_file: str = "",
     ):
@@ -57,6 +62,10 @@ class CrabAgent:
         self.robot_type = robot_type
         self.task_description = task_description
         self.subtask_description = subtask_description
+        self.scene_description = scene_description
+        self.peer_ids = tuple(peer_ids)
+        self.assigned_targets = set(OBJECT_ID_RE.findall(subtask_description))
+        self.completed_targets: set[str] = set()
         # create system message
         system_message = ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE.format(
             robot_type=self.robot_type,
@@ -64,6 +73,18 @@ class CrabAgent:
             # task_description=task_description,
             subtask_description=subtask_description,
         )
+        if get_llm_backend() == "qwen":
+            peers = ", ".join(self.peer_ids) or "none"
+            system_message += (
+                "\nOriginal task:\n"
+                f'"""\n{task_description}\n"""\n'
+                "Scene description:\n"
+                f'"""\n{scene_description}\n"""\n'
+                f"Valid peer agents: {peers}. "
+                "Return exactly one function call per action step. "
+                "Use wait only when your assigned subtask is Nothing to do or "
+                "all targets assigned to you have been completed."
+            )
         # Initialize the OpenAI LLM model
         self.llm_model = OpenAIModel(
             system_message, 
@@ -75,7 +96,7 @@ class CrabAgent:
         )
         
         # Inject chat history from group discussion phase
-        if chat_history is not None:
+        if chat_history is not None and get_llm_backend() != "qwen":
             self.llm_model.chat_history = chat_history
 
         # Set logging parameters
@@ -100,6 +121,14 @@ class CrabAgent:
                 f"You are provided with the following actions:\n{self.action_prompt}\n"
                 "Now you should plan a FULL subtask action sequence to complete the WHOLE task."
             )
+        if get_llm_backend() == "qwen":
+            subtask_to_actions_prompt = (
+                f"Assigned subtask:\n{subtask_description or task_description}\n"
+                f"Available actions:\n{self.action_prompt}\n"
+                "Write a concise ordered action plan using exact action names and "
+                "exact object IDs. Do not answer with feasibility yes/no and do not "
+                "make function calls during this planning response."
+            )
         print("===============CrabAgent Prompt==============")
         print(subtask_to_actions_prompt)
         response = self.llm_model.chat(subtask_to_actions_prompt, crab_planning=True)
@@ -112,18 +141,33 @@ class CrabAgent:
             observation = str(observation) + " " + prompt
             CrabAgent.message_pipe[self.name] = []
 
-        action_name, parameters = self.llm_model.chat(str(observation))
+        try:
+            if get_llm_backend() == "qwen":
+                action_name, parameters = self.llm_model.chat(
+                    str(observation),
+                    action_validator=self._validate_qwen_action,
+                )
+            else:
+                action_name, parameters = self.llm_model.chat(str(observation))
+        except QwenActionProtocolError as error:
+            print(f"Qwen action source: protocol_fallback; reason: {error}")
+            return {"name": "wait", "arguments": ["500"]}
+
         if action_name == "send_request":
             target_agent = parameters["target_agent"]
-            if target_agent == self.name:  # send request to itself
+            if target_agent == self.name:
                 return None
             request = parameters["request"]
             if target_agent not in CrabAgent.message_pipe:
                 CrabAgent.message_pipe[target_agent] = []
             prompt = REQUEST_TEMPLATE.format(source_agent=self.name, request=request)
             CrabAgent.message_pipe[target_agent].append(prompt)
+            if get_llm_backend() == "qwen":
+                print("Qwen action source: send_request")
             return {"name": "wait", "arguments": ["500"]}
         if action_name == "wait":
+            if get_llm_backend() == "qwen":
+                print("Qwen action source: model_wait")
             return {"name": "wait", "arguments": ["500"]}
         if action_name in [
             "nav_to_obj",
@@ -132,10 +176,37 @@ class CrabAgent:
             "place",
             "pick",
         ]:
+            if get_llm_backend() == "qwen" and action_name == "nav_to_obj":
+                self.completed_targets.add(parameters["target_obj"])
             parameters["robot"] = self.name
             return {"name": action_name, "arguments": parameters}
-        else:
-            return {"name": action_name, "arguments": parameters}
+        return {"name": action_name, "arguments": parameters}
+
+    def _validate_qwen_action(
+        self, action_name: str, parameters: dict
+    ) -> Optional[str]:
+        if action_name == "send_request":
+            target_agent = parameters.get("target_agent")
+            if target_agent not in self.peer_ids or target_agent == self.name:
+                return (
+                    f"target_agent {target_agent!r} is not a real peer; "
+                    f"choose one of {self.peer_ids}"
+                )
+        elif action_name == "nav_to_obj":
+            target_obj = parameters.get("target_obj")
+            if target_obj not in self.assigned_targets:
+                return (
+                    f"target_obj {target_obj!r} is not in the assigned subtask; "
+                    f"choose one of {sorted(self.assigned_targets)}"
+                )
+        elif action_name == "wait":
+            nothing_to_do = (
+                self.subtask_description.strip().lower() == "nothing to do"
+            )
+            unfinished = self.assigned_targets - self.completed_targets
+            if not nothing_to_do and unfinished:
+                return f"assigned targets are unfinished: {sorted(unfinished)}"
+        return None
 
 def _generate_action_prompt(action_space: list[Action], include_arguments: bool = False) -> str:
     if include_arguments:

@@ -389,6 +389,8 @@ def group_discussion(
                 task_description=task_description,
                 subtask_description="",
                 chat_history=None,
+                scene_description=scene_description,
+                peer_ids=tuple(peer for peer in robot_ids if peer != robot_key),
             )
         
         return results
@@ -468,6 +470,8 @@ def group_discussion(
                 # subtask_description=robot_tasks[agent],
                 subtask_description=robot_tasks.get(agent, "Nothing to do"),
                 chat_history=agents[agent].chat_history,
+                scene_description=scene_description,
+                peer_ids=tuple(peer for peer in robot_ids if peer != agent),
             )
         return results
 
@@ -542,6 +546,8 @@ def group_discussion(
             # subtask_description=robot_tasks[agent],
             subtask_description=robot_tasks.get(agent, "Nothing to do"),
             chat_history=agents[agent].chat_history,
+            scene_description=scene_description,
+            peer_ids=tuple(peer for peer in robot_ids if peer != agent),
         )
     leader_tokens = leader.token_usage
     robot_tokens = sum([agent.token_usage for agent in agents.values()])
@@ -714,6 +720,8 @@ class MultiLLMPolicy(MultiPolicy):
                     task_description=args.task_description,
                     subtask_description=args.subtask_description,
                     chat_history=args.chat_history,
+                    scene_description=args.scene_description,
+                    peer_ids=args.peer_ids,
                     enable_logging=save_chat_history,
                     logging_file=logging_path,
                 )

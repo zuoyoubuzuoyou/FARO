@@ -10,3 +10,5 @@ class AgentArguments:
     task_description: str
     subtask_description: str
     chat_history: list[dict[str, str]]
+    scene_description: str = ""
+    peer_ids: tuple[str, ...] = ()

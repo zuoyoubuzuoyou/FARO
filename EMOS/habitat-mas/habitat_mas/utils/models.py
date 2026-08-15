@@ -1,14 +1,19 @@
 import json
 import os
 from ..agents.crab_core import Action
-from typing import List
+from typing import Any, Callable, List, Optional
 import openai
 from .python_interpreter import SubprocessInterpreter
 # from openai.types.chat.chat_completion import ChatCompletionMessage
 # from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .llm_backend import get_llm_backend
+
+
+class QwenActionProtocolError(RuntimeError):
+    pass
+
 
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -97,7 +102,12 @@ class OpenAIModel:
         print("Internal action: ", action_name, parameters)
         return str(self.action_map[action_name].run(**parameters))
 
-    def chat(self, content: str, crab_planning=False):
+    def chat(
+        self,
+        content: str,
+        crab_planning=False,
+        action_validator: Optional[Callable[[str, dict[str, Any]], Optional[str]]] = None,
+    ):
         new_message = {"role": "user", "content": content}
 
         request = [self.system_message]
@@ -192,6 +202,8 @@ class OpenAIModel:
                     self.save_chat_history(self.logging_file)
                 return response_message.content
         else:
+            if self.backend == "qwen":
+                return self._chat_qwen_action(request, action_validator)
             response = self.client.chat.completions.create(
                 messages=request,  # type: ignore
                 model=self.model,
@@ -204,8 +216,6 @@ class OpenAIModel:
 
             response_message = response.choices[0].message
             self.chat_history[-1].append(response_message)
-            if self.backend == "qwen":
-                return self._parse_qwen_action_response(response_message)
             tool_calls = response_message.tool_calls
             for idx, tool_call in enumerate(tool_calls):
                 self.chat_history[-1].append(
@@ -318,37 +328,94 @@ class OpenAIModel:
             self.chat_history[-1].append(result_message)
             request.append(result_message)
 
+    def _chat_qwen_action(self, request, action_validator, max_attempts=3):
+        last_error = "unknown action protocol error"
+        action_names = ", ".join(self.action_map)
+        for attempt in range(max_attempts):
+            response = self.client.chat.completions.create(
+                messages=list(request),
+                model=self.model,
+                tools=[
+                    {"type": "function", "function": action}
+                    for action in self.actions
+                ],
+                tool_choice="required",
+            )
+            self.token_usage += response.usage.total_tokens
+            response_message = response.choices[0].message
+            self.chat_history[-1].append(response_message)
+            try:
+                action_name, parameters = self._parse_qwen_action_response(
+                    response_message
+                )
+                if action_validator is not None:
+                    validator_error = action_validator(action_name, parameters)
+                    if validator_error:
+                        raise QwenActionProtocolError(validator_error)
+            except QwenActionProtocolError as error:
+                last_error = str(error)
+                if attempt + 1 < max_attempts:
+                    correction = {
+                        "role": "user",
+                        "content": (
+                            "Your previous action response is invalid: "
+                            f"{last_error}. Return exactly one valid function "
+                            f"call using one of: {action_names}."
+                        ),
+                    }
+                    self.chat_history[-1].append(correction)
+                    request.append(correction)
+                continue
+
+            call = response_message.tool_calls[0]
+            self.chat_history[-1].append(
+                {
+                    "tool_call_id": call.id,
+                    "role": "tool",
+                    "name": call.function.name,
+                    "content": "Success",
+                }
+            )
+            if self.save_on_each_chat:
+                self.save_chat_history(self.logging_file)
+            return action_name, parameters
+
+        if self.save_on_each_chat:
+            self.save_chat_history(self.logging_file)
+        raise QwenActionProtocolError(last_error)
+
     def _parse_qwen_action_response(self, response_message):
         tool_calls = response_message.tool_calls or []
         if not tool_calls:
-            if self.save_on_each_chat:
-                self.save_chat_history(self.logging_file)
-            return ("wait", {})
-
-        for idx, tool_call in enumerate(tool_calls):
-            self.chat_history[-1].append(
-                {
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": tool_call.function.name,
-                    "content": (
-                        "Success" if idx == 0 else "Only the first tool call is used"
-                    ),
-                }
+            raise QwenActionProtocolError("no tool call")
+        if len(tool_calls) != 1:
+            raise QwenActionProtocolError(
+                f"expected exactly one tool call, got {len(tool_calls)}"
             )
 
         call = tool_calls[0]
         if call.function.name not in self.action_map:
-            return ("wait", {})
+            raise QwenActionProtocolError(
+                f"unknown tool: {call.function.name}"
+            )
         try:
             parameters = json.loads(call.function.arguments)
-        except (json.JSONDecodeError, TypeError):
-            return ("wait", {})
+        except (json.JSONDecodeError, TypeError) as error:
+            raise QwenActionProtocolError(
+                f"malformed JSON arguments: {error}"
+            ) from error
         if not isinstance(parameters, dict):
-            return ("wait", {})
-        if self.save_on_each_chat:
-            self.save_chat_history(self.logging_file)
-        return (call.function.name, parameters)
+            raise QwenActionProtocolError("tool arguments must be a JSON object")
+
+        action = self.action_map[call.function.name]
+        if hasattr(action, "parameters"):
+            try:
+                action.parameters(**parameters)
+            except ValidationError as error:
+                raise QwenActionProtocolError(
+                    f"arguments do not match schema: {error}"
+                ) from error
+        return call.function.name, parameters
 
 
     def _convert_action_to_schema(self, action_space):
