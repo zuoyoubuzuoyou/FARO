@@ -121,3 +121,18 @@ def test_qwen_reflection_retries_non_protocol_response():
     assert response == "{{yes}}"
     assert verdict == ("yes", None)
     assert "not protocol response" in robot.chat.call_args_list[1].args[0]
+
+
+def test_qwen_reflection_exhaustion_returns_labeled_advisory_fallback():
+    robot = Mock()
+    bad = "{{no||The assumed vertical FOV makes detection impossible.}}"
+    robot.chat.return_value = bad
+
+    with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "qwen"}, clear=False):
+        response, verdict = request_qwen_reflection(
+            robot, "initial reflection", ("any_targets|0",)
+        )
+
+    assert response == bad
+    assert verdict == ("invalid", "unsupported detection geometry assumptions")
+    assert robot.chat.call_count == 3

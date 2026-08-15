@@ -372,7 +372,12 @@ def request_qwen_reflection(
                 + "Return only {{yes}} or {{no||reason}}."
             )
 
-    raise QwenReflectionValidationError("; ".join(last_violations))
+    fallback_reason = "; ".join(last_violations)
+    print(
+        "Qwen reflection source: validation_fallback; "
+        f"reason: {fallback_reason}"
+    )
+    return response, ("invalid", fallback_reason)
 
 
 # DISCUSSION_TOOLS = [eval_python_code, add, subtract, multiply, divide]
