@@ -407,6 +407,37 @@ def test_qwen_issued_navigation_does_not_mark_detection_complete(monkeypatch):
     assert agent.completed_targets == set()
 
 
+def test_qwen_help_request_is_once_per_original_assigned_target(monkeypatch):
+    CrabAgent.message_pipe = {}
+    agent = make_crab_agent(
+        monkeypatch,
+        "qwen",
+        "Detect any_targets|0",
+        task_description="Detect any_targets|0 and any_targets|1",
+    )
+    request = {
+        "request": "Detect object any_targets|0",
+        "target_agent": "agent_1",
+    }
+    agent.llm_model.chat = Mock(return_value=("send_request", request))
+
+    assert agent.chat("step", completed_targets=()) == {
+        "name": "wait",
+        "arguments": ["500"],
+    }
+    assert agent.requested_help_targets == {"any_targets|0"}
+    assert "already requested" in agent._validate_qwen_action(
+        "send_request", request
+    )
+    assert "original assigned target" in agent._validate_qwen_action(
+        "send_request",
+        {
+            "request": "Detect object any_targets|1",
+            "target_agent": "agent_1",
+        },
+    )
+
+
 def test_qwen_real_peer_request_temporarily_authorizes_explicit_goal(monkeypatch):
     CrabAgent.message_pipe = {
         "agent_0": [

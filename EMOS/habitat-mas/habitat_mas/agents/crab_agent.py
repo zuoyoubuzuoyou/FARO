@@ -71,6 +71,7 @@ class CrabAgent:
             if not target.startswith("TARGET_")
         }
         self.delegated_targets: set[str] = set()
+        self.requested_help_targets: set[str] = set()
         self.completed_targets: set[str] = set()
         # create system message
         system_message = ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE.format(
@@ -89,6 +90,8 @@ class CrabAgent:
                 f"Valid peer agents: {peers}. "
                 "A request from a valid peer may temporarily authorize an "
                 "explicit global detection goal named in that request. "
+                "Request help at most once for one unfinished target originally "
+                "assigned to you; never redelegate a peer request. "
                 "Return exactly one function call per action step. "
                 "Use wait only when your assigned subtask is Nothing to do or "
                 "all targets assigned to you have been completed."
@@ -181,6 +184,11 @@ class CrabAgent:
             if target_agent == self.name:
                 return None
             request = parameters["request"]
+            if get_llm_backend() == "qwen":
+                request_targets = set(OBJECT_ID_RE.findall(request))
+                self.requested_help_targets.update(
+                    request_targets & self.assigned_targets
+                )
             if target_agent not in CrabAgent.message_pipe:
                 CrabAgent.message_pipe[target_agent] = []
             prompt = REQUEST_TEMPLATE.format(source_agent=self.name, request=request)
@@ -213,6 +221,24 @@ class CrabAgent:
                     f"target_agent {target_agent!r} is not a real peer; "
                     f"choose one of {self.peer_ids}"
                 )
+            request_targets = set(
+                OBJECT_ID_RE.findall(parameters.get("request", ""))
+            )
+            if len(request_targets) != 1:
+                return (
+                    "send_request must name exactly one original "
+                    "assigned target"
+                )
+            request_target = next(iter(request_targets))
+            if request_target not in self.assigned_targets:
+                return (
+                    f"request target {request_target!r} is not an original "
+                    "assigned target"
+                )
+            if request_target in self.completed_targets:
+                return f"request target {request_target!r} is already completed"
+            if request_target in self.requested_help_targets:
+                return f"help was already requested for {request_target!r}"
         elif action_name == "nav_to_obj":
             target_obj = parameters.get("target_obj")
             allowed_targets = self.assigned_targets | self.delegated_targets
