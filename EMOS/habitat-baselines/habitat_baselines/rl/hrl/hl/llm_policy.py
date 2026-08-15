@@ -30,6 +30,14 @@ def get_llm_actions(action_pool, skill_names, backend):
     ]
 
 
+def get_true_detected_objects(predicates, predicate_values):
+    return tuple(
+        predicate._arg_values[0].name
+        for predicate, is_true in zip(predicates, predicate_values)
+        if is_true.item() == 1.0 and predicate.name == "is_detected"
+    )
+
+
 class LLMHighLevelPolicy(HighLevelPolicy):
     """
     High-level policy that uses an LLM agent to select skills.
@@ -55,6 +63,10 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             ACTION_POOL, self._skill_name_to_idx, get_llm_backend()
         )
         self.llm_agent = self._init_llm_agent(kwargs["agent_name"], llm_actions)
+        if get_llm_backend() == "qwen":
+            self._qwen_predicates_list = (
+                self._pddl_prob.get_possible_predicates()
+            )
 
     def _init_llm_agent(self, agent_name, action_list):
         # Initialize the LLM agent here based on the config
@@ -149,7 +161,20 @@ class LLMHighLevelPolicy(HighLevelPolicy):
 
             # Query the LLM agent with the current observations
             # to get the next action and arguments
-            llm_output = self.llm_agent.chat(get_next_action_message)
+            if get_llm_backend() == "qwen":
+                completed_targets = get_true_detected_objects(
+                    self._qwen_predicates_list,
+                    observations["all_predicates"][batch_idx],
+                )
+                print(
+                    f"Qwen PDDL detected targets: {completed_targets}"
+                )
+                llm_output = self.llm_agent.chat(
+                    get_next_action_message,
+                    completed_targets=completed_targets,
+                )
+            else:
+                llm_output = self.llm_agent.chat(get_next_action_message)
             print("=================llm_output===================")
             print("Agent: ", self.llm_agent.name)
             print(llm_output)

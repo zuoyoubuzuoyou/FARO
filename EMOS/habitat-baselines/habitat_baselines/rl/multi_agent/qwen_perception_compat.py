@@ -105,6 +105,21 @@ def validate_assignment(
             "not explicit goal objects: " + ", ".join(irrelevant_objects)
         )
 
+    manipulation_agents = tuple(
+        robot_id
+        for robot_id in robot_ids
+        if re.search(
+            r"\b(?:pick|place|rearrange|reset_arm)\b",
+            tasks.get(robot_id, ""),
+            re.IGNORECASE,
+        )
+    )
+    if manipulation_agents:
+        violations.append(
+            "manipulation actions are invalid for detection-only assignments: "
+            + ", ".join(manipulation_agents)
+        )
+
     assigned_goal_objects = set(assigned_objects) & valid_goal_objects
     uncovered_objects = tuple(
         object_id

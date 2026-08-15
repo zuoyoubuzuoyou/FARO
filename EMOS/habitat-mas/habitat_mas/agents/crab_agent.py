@@ -135,7 +135,13 @@ class CrabAgent:
         print("===============CrabAgent Subtasks==============")
         print(response)
 
-    def chat(self, observation: str) -> Optional[dict]:
+    def chat(
+        self,
+        observation: str,
+        completed_targets: Optional[tuple[str, ...]] = None,
+    ) -> Optional[dict]:
+        if get_llm_backend() == "qwen" and completed_targets is not None:
+            self.completed_targets = set(completed_targets)
         if self.name in CrabAgent.message_pipe and CrabAgent.message_pipe[self.name]:
             prompt = " ".join(CrabAgent.message_pipe[self.name])
             observation = str(observation) + " " + prompt
@@ -176,8 +182,6 @@ class CrabAgent:
             "place",
             "pick",
         ]:
-            if get_llm_backend() == "qwen" and action_name == "nav_to_obj":
-                self.completed_targets.add(parameters["target_obj"])
             parameters["robot"] = self.name
             return {"name": action_name, "arguments": parameters}
         return {"name": action_name, "arguments": parameters}

@@ -357,3 +357,18 @@ def test_qwen_nothing_to_do_allows_model_wait(monkeypatch):
     agent = make_crab_agent(monkeypatch, "qwen", "Nothing to do")
 
     assert agent._validate_qwen_action("wait", {}) is None
+
+
+def test_qwen_issued_navigation_does_not_mark_detection_complete(monkeypatch):
+    agent = make_crab_agent(monkeypatch, "qwen", "Detect any_targets|0")
+    agent.llm_model.chat = Mock(
+        return_value=("nav_to_obj", {"target_obj": "any_targets|0"})
+    )
+
+    action = agent.chat("step", completed_targets=())
+
+    assert action == {
+        "name": "nav_to_obj",
+        "arguments": {"target_obj": "any_targets|0", "robot": "agent_0"},
+    }
+    assert agent.completed_targets == set()

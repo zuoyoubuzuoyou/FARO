@@ -322,6 +322,59 @@ def parse_qwen_agent_response(text):
     return "no", text
 
 
+class QwenReflectionValidationError(ValueError):
+    pass
+
+
+def request_qwen_reflection(
+    robot_model: OpenAIModel,
+    prompt: str,
+    goal_objects: tuple[str, ...],
+    max_attempts: int = 3,
+):
+    last_violations = ()
+    for attempt in range(max_attempts):
+        response = robot_model.chat(prompt)
+        verdict = parse_qwen_agent_response(response)
+        violations = []
+        if verdict == ("no", response):
+            violations.append("response does not follow the reflection protocol")
+        elif verdict[0] == "no":
+            reason = (verdict[1] or "").lower()
+            unsupported_terms = (
+                "vertical fov",
+                "vfov",
+                "field of view",
+                "pitch",
+                "downward",
+                "altitude",
+                "camera orientation",
+                "arm reach",
+                "workspace",
+                "nearest navigable point",
+                "degrees",
+            )
+            if any(term in reason for term in unsupported_terms):
+                violations.append("unsupported detection geometry assumptions")
+
+        if not violations:
+            return response, verdict
+        last_violations = tuple(violations)
+        if attempt + 1 < max_attempts:
+            prompt = (
+                "Your previous detection reflection is invalid: "
+                + "; ".join(violations)
+                + f". Previous response: {response}\n"
+                + "Do not infer vertical FOV, camera pitch or orientation, "
+                + "flight altitude, manipulation reach, or impossibility from "
+                + "nearest-navigable-point distance. Evaluate only documented "
+                + f"facts for these goals: {', '.join(goal_objects)}. "
+                + "Return only {{yes}} or {{no||reason}}."
+            )
+
+    raise QwenReflectionValidationError("; ".join(last_violations))
+
+
 # DISCUSSION_TOOLS = [eval_python_code, add, subtract, multiply, divide]
 DISCUSSION_TOOLS = []
 
@@ -485,8 +538,14 @@ def group_discussion(
             compute_path=compute_path,
             goal_objects=goal_objects,
         )
-        response = robot_model.chat(robot_start_message)
-        agent_response[robot_id] = parse_agent_response(response)
+        if get_llm_backend() == "qwen" and goal_objects:
+            response, parsed_response = request_qwen_reflection(
+                robot_model, robot_start_message, goal_objects
+            )
+        else:
+            response = robot_model.chat(robot_start_message)
+            parsed_response = parse_agent_response(response)
+        agent_response[robot_id] = parsed_response
         print("===============Robot Response==============")
         print(f"Robot {robot_id} response: {response}")
         print("===========================================")
@@ -532,8 +591,14 @@ def group_discussion(
                 compute_path=compute_path,
                 goal_objects=goal_objects,
             )
-            response = robot_model.chat(robot_start_message)
-            agent_response[robot_id] = parse_agent_response(response)
+            if get_llm_backend() == "qwen" and goal_objects:
+                response, parsed_response = request_qwen_reflection(
+                    robot_model, robot_start_message, goal_objects
+                )
+            else:
+                response = robot_model.chat(robot_start_message)
+                parsed_response = parse_agent_response(response)
+            agent_response[robot_id] = parsed_response
             print("===============Robot Response==============")
             print(f"Robot {robot_id} response: {response}")
             print("===========================================")

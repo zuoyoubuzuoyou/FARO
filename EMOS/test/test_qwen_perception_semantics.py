@@ -66,6 +66,11 @@ def test_assignment_contract_identifies_real_agents_and_goal_vocabulary():
             "{agent_2||Assist agent_1}",
             "invalid agent IDs: agent_2",
         ),
+        (
+            "{agent_0||Detect any_targets|0 and rearrange it}"
+            "{agent_1||Detect any_targets|1}",
+            "manipulation actions",
+        ),
     ],
 )
 def test_rejects_observed_invalid_assignments(response, expected_fragment):

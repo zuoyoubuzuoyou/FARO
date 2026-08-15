@@ -1,12 +1,13 @@
 import hashlib
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from habitat_baselines.rl.multi_agent.multi_llm_policy import (
     create_leader_prompt,
     create_robot_prompt,
     create_robot_start_message,
     parse_agent_response,
+    request_qwen_reflection,
 )
 
 
@@ -87,3 +88,36 @@ def test_qwen_robot_reflection_forbids_invented_detection_geometry():
     assert "Do not invent" in prompt
     assert "nearest navigable" in prompt
     assert "any_targets|0" in prompt
+
+
+def test_qwen_reflection_retries_unsupported_geometry_and_accepts_correction():
+    robot = Mock()
+    robot.chat.side_effect = [
+        "{{no||Assuming vertical FOV is plus or minus 45 degrees, the target is outside range.}}",
+        "{{yes}}",
+    ]
+
+    with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "qwen"}, clear=False):
+        response, verdict = request_qwen_reflection(
+            robot, "initial reflection", ("any_targets|0",)
+        )
+
+    assert response == "{{yes}}"
+    assert verdict == ("yes", None)
+    assert robot.chat.call_count == 2
+    correction = robot.chat.call_args_list[1].args[0]
+    assert "unsupported detection geometry" in correction
+
+
+def test_qwen_reflection_retries_non_protocol_response():
+    robot = Mock()
+    robot.chat.side_effect = ["not protocol response", "{{yes}}"]
+
+    with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "qwen"}, clear=False):
+        response, verdict = request_qwen_reflection(
+            robot, "initial reflection", ("any_targets|0",)
+        )
+
+    assert response == "{{yes}}"
+    assert verdict == ("yes", None)
+    assert "not protocol response" in robot.chat.call_args_list[1].args[0]
