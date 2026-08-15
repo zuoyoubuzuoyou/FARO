@@ -1,8 +1,11 @@
+import hashlib
 import os
 from unittest.mock import patch
 
 from habitat_baselines.rl.multi_agent.multi_llm_policy import (
+    create_leader_prompt,
     create_robot_prompt,
+    create_robot_start_message,
     parse_agent_response,
 )
 
@@ -57,3 +60,30 @@ def test_gpt_parser_keeps_existing_case_sensitive_first_match_behavior():
     with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "gpt"}, clear=False):
         assert parse_agent_response("{no||first} then {yes}") == ("no", "first")
         assert parse_agent_response("{YES}") == ("no", "{YES}")
+
+
+def test_gpt_leader_and_robot_start_prompts_remain_exactly_unchanged():
+    with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "gpt"}, clear=False):
+        leader = create_leader_prompt("resume")
+        robot = create_robot_start_message("task", "scene")
+
+    assert hashlib.sha256(leader.encode()).hexdigest() == (
+        "f9db97b5e3c99340501ab52f4fd273fef5c06b147b888307422a31817bc749d7"
+    )
+    assert hashlib.sha256(robot.encode()).hexdigest() == (
+        "91561a1c94ecd933e174e461ddfda672317b73c7d719886db6c8e97ca8d8a15f"
+    )
+
+
+def test_qwen_robot_reflection_forbids_invented_detection_geometry():
+    with patch.dict(os.environ, {"EMOS_LLM_BACKEND": "qwen"}, clear=False):
+        prompt = create_robot_start_message(
+            "Detect any_targets|0",
+            "scene",
+            goal_objects=("any_targets|0",),
+        )
+
+    assert "Do not apply manipulation workspace" in prompt
+    assert "Do not invent" in prompt
+    assert "nearest navigable" in prompt
+    assert "any_targets|0" in prompt

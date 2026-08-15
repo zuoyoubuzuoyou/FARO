@@ -16,6 +16,15 @@ from habitat_mas.utils import AgentArguments
 from habitat_mas.utils.llm_backend import get_llm_backend
 from habitat_mas.utils.models import OpenAIModel
 
+from habitat_baselines.rl.multi_agent.qwen_perception_compat import (
+    QwenAssignmentValidationError,
+    build_assignment_contract,
+    build_assignment_correction,
+    extract_detection_goal_objects,
+    parse_qwen_assignment,
+    validate_assignment,
+)
+
 from habitat_baselines.common.storage import Storage
 from habitat_baselines.common.tensor_dict import TensorDict
 from habitat_baselines.rl.multi_agent.pop_play_wrappers import (
@@ -50,7 +59,7 @@ ROBOT_RESUME_TEMPLATE = (
     '"""\n{capabilities}\n"""\n\n'
 )
 
-def create_leader_prompt(robot_resume):
+def create_leader_prompt(robot_resume, robot_ids=(), goal_objects=()):
 
     LEADER_SYSTEM_PROMPT_TEMPLATE = (
         "You are a group discussion leader."
@@ -68,8 +77,11 @@ def create_leader_prompt(robot_resume):
         "Remember the subtask target should always include 'objects', DO NOT include 'region' in |subtask description|. \n"
     )
     
-    return LEADER_SYSTEM_PROMPT_TEMPLATE.format(
+    prompt = LEADER_SYSTEM_PROMPT_TEMPLATE.format(
         robot_resume=robot_resume) + FORMAT_INSTRUCTION
+    if get_llm_backend() == "qwen" and goal_objects:
+        prompt += build_assignment_contract(tuple(robot_ids), tuple(goal_objects))
+    return prompt
 
 
 def create_leader_start_message(task_description, scene_description):
@@ -127,7 +139,12 @@ def create_robot_prompt(robot_type, robot_key, capabilities, execute_code=True):
             robot_key=robot_key,
             capabilities=capabilities) + FORMAT_INSTRUCTION
 
-def create_robot_start_message(task_description, scene_description, compute_path: bool = False):
+def create_robot_start_message(
+    task_description,
+    scene_description,
+    compute_path: bool = False,
+    goal_objects=(),
+):
 
     ROBOT_GROUP_DISCUSS_MESSAGE_TEMPLATE = (
         " Your task is to work with other agents to complete the assigned subtask described below:\n\n"
@@ -152,6 +169,16 @@ def create_robot_start_message(task_description, scene_description, compute_path
         ROBOT_GROUP_DISCUSS_MESSAGE_TEMPLATE += COMPUTE_PATH
     else:
         ROBOT_GROUP_DISCUSS_MESSAGE_TEMPLATE += COMPUTE_SPACE
+    if get_llm_backend() == "qwen" and goal_objects:
+        ROBOT_GROUP_DISCUSS_MESSAGE_TEMPLATE += (
+            " Qwen detection feasibility contract: Judge only the assigned "
+            f"explicit goal objects ({', '.join(goal_objects)}). Do not apply "
+            "manipulation workspace or arm reachability to a detection-only "
+            "subtask. Do not invent missing vertical FOV, camera pitch, sensor "
+            "orientation, flight altitude, or additional robots. A nearest "
+            "navigable-point distance is not proof of detection impossibility, "
+            "because navigation can reposition the sensor."
+        )
 
     return ROBOT_GROUP_DISCUSS_MESSAGE_TEMPLATE.format(
         task_description=task_description, 
@@ -204,6 +231,35 @@ def parse_leader_response(text):
     }
 
     return robot_tasks
+
+
+def request_qwen_assignment(
+    leader,
+    prompt,
+    robot_ids,
+    goal_objects,
+    max_attempts=3,
+):
+    last_violations = ()
+    for attempt in range(max_attempts):
+        response = leader.chat(prompt)
+        tasks = parse_qwen_assignment(response)
+        violations = validate_assignment(
+            response,
+            tasks,
+            tuple(robot_ids),
+            tuple(goal_objects),
+        )
+        if not violations:
+            return response, tasks
+        last_violations = violations
+        if attempt + 1 < max_attempts:
+            prompt = build_assignment_correction(
+                violations,
+                tuple(robot_ids),
+                tuple(goal_objects),
+            )
+    raise QwenAssignmentValidationError("; ".join(last_violations))
 
 
 def parse_agent_response(text):
@@ -299,6 +355,8 @@ def group_discussion(
     ### 1. Get robot info from the beginning of the group discussion
     compute_path = "regions_description" in scene_description
     robot_resume = json.loads(robot_resume)
+    robot_ids = tuple(robot_resume)
+    goal_objects = extract_detection_goal_objects(task_description)
     robot_resume_prompt = ""
     capabilities_list = {}
 
@@ -336,7 +394,11 @@ def group_discussion(
         return results
     
     ### 3. create a leader agent, no chat yet
-    leader_prompt = create_leader_prompt(robot_resume_prompt)
+    leader_prompt = create_leader_prompt(
+        robot_resume_prompt,
+        robot_ids=robot_ids,
+        goal_objects=goal_objects,
+    )
 
     leader = OpenAIModel(
         leader_prompt,
@@ -375,10 +437,18 @@ def group_discussion(
         task_description=task_description, 
         scene_description=scene_description
     )
-    response = leader.chat(leader_start_message)
-    robot_tasks = parse_leader_response(response)
-    # 只保留真实机器人 key，过滤掉 LLM 复述模板产生的垃圾 key
-    robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
+    if get_llm_backend() == "qwen" and goal_objects:
+        response, robot_tasks = request_qwen_assignment(
+            leader,
+            leader_start_message,
+            robot_ids,
+            goal_objects,
+        )
+    else:
+        response = leader.chat(leader_start_message)
+        robot_tasks = parse_leader_response(response)
+        # 只保留真实机器人 key，过滤掉 LLM 复述模板产生的垃圾 key
+        robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
     print("===============Scene Description==============")
     print(scene_description)
     print("===============Task Description==============")
@@ -408,6 +478,7 @@ def group_discussion(
             task_description=robot_tasks[robot_id],
             scene_description=scene_description,
             compute_path=compute_path,
+            goal_objects=goal_objects,
         )
         response = robot_model.chat(robot_start_message)
         agent_response[robot_id] = parse_agent_response(response)
@@ -433,9 +504,17 @@ def group_discussion(
             r"Each agent should still be described in the format: {robot_id||subtask_description}\n"
         )
 
-        response = leader.chat(prompt)
-        robot_tasks = parse_leader_response(response)
-        robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
+        if get_llm_backend() == "qwen" and goal_objects:
+            response, robot_tasks = request_qwen_assignment(
+                leader,
+                prompt,
+                robot_ids,
+                goal_objects,
+            )
+        else:
+            response = leader.chat(prompt)
+            robot_tasks = parse_leader_response(response)
+            robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
 
         print("===============Leader Response==============")
         print(response)
@@ -446,6 +525,7 @@ def group_discussion(
                 task_description=robot_tasks[robot_id],
                 scene_description=scene_description,
                 compute_path=compute_path,
+                goal_objects=goal_objects,
             )
             response = robot_model.chat(robot_start_message)
             agent_response[robot_id] = parse_agent_response(response)

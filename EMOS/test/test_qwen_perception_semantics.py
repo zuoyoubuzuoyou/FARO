@@ -1,10 +1,16 @@
+from unittest.mock import Mock
+
 import pytest
 
 from habitat_baselines.rl.multi_agent.qwen_perception_compat import (
+    QwenAssignmentValidationError,
     build_assignment_contract,
     extract_detection_goal_objects,
     parse_qwen_assignment,
     validate_assignment,
+)
+from habitat_baselines.rl.multi_agent.multi_llm_policy import (
+    request_qwen_assignment,
 )
 
 
@@ -103,3 +109,48 @@ def test_accepts_complete_assignment_generated_by_the_model():
         ROBOT_IDS,
         GOAL_OBJECTS,
     ) == ()
+
+
+def test_qwen_leader_retries_invalid_assignment_and_accepts_model_correction():
+    leader = Mock()
+    leader.chat.side_effect = [
+        "{agent_0||Nothing to do}{agent_1||Detect TARGET_any_targets|0}",
+        "{agent_0||Detect any_targets|0}{agent_1||Detect any_targets|1}",
+    ]
+
+    response, tasks = request_qwen_assignment(
+        leader,
+        "initial prompt",
+        ROBOT_IDS,
+        GOAL_OBJECTS,
+    )
+
+    assert response.endswith("{agent_1||Detect any_targets|1}")
+    assert tasks == {
+        "agent_0": "Detect any_targets|0",
+        "agent_1": "Detect any_targets|1",
+    }
+    assert leader.chat.call_count == 2
+    correction = leader.chat.call_args_list[1].args[0]
+    assert "uncovered goal objects" in correction
+    assert "Decide the agent-to-object mapping yourself" in correction
+
+
+def test_qwen_leader_exhaustion_never_synthesizes_assignment():
+    leader = Mock()
+    leader.chat.return_value = (
+        "{agent_0||Nothing to do}{agent_1||Nothing to do}"
+    )
+
+    with pytest.raises(
+        QwenAssignmentValidationError,
+        match="uncovered goal objects",
+    ):
+        request_qwen_assignment(
+            leader,
+            "initial prompt",
+            ROBOT_IDS,
+            GOAL_OBJECTS,
+        )
+
+    assert leader.chat.call_count == 3

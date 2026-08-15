@@ -13,6 +13,10 @@ OBJECT_ID_RE = re.compile(r"(?:TARGET_)?any_targets\|\d+")
 ASSIGNMENT_RE = re.compile(r"\{([^{}|]+)\|\|([^{}]*)\}")
 
 
+class QwenAssignmentValidationError(ValueError):
+    pass
+
+
 def _unique(items):
     return tuple(dict.fromkeys(items))
 
