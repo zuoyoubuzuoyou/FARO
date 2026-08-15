@@ -1,10 +1,19 @@
 import shlex
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Dict, List
 
 from colorama import Fore
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool
 
 
 class SubprocessInterpreter:
@@ -146,6 +155,57 @@ class SubprocessInterpreter:
 
         temp_file_path.unlink()
         return result
+
+    def run_python_detailed(
+        self, code: str, timeout_seconds: float = 10
+    ) -> ExecutionResult:
+        """Execute generated Python with validation, timeout, and structured output."""
+        try:
+            compile(code, "<qwen-generated>", "exec")
+        except SyntaxError as error:
+            return ExecutionResult(
+                returncode=1,
+                stdout="",
+                stderr=f"SyntaxError: line {error.lineno}: {error.msg}",
+                timed_out=False,
+            )
+
+        executable_code = (
+            'import warnings\nwarnings.filterwarnings("ignore")\n' + code
+        )
+        temp_file_path = self._create_temp_file(
+            code=executable_code,
+            extension=self._CODE_EXTENSION_MAPPING["python"],
+        )
+        try:
+            cmd = shlex.split(
+                self._CODE_EXECUTE_CMD_MAPPING["python"].format(
+                    file_name=str(temp_file_path)
+                )
+            )
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                return ExecutionResult(
+                    returncode=proc.returncode if proc.returncode is not None else -1,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=True,
+                )
+            return ExecutionResult(
+                returncode=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=False,
+            )
+        finally:
+            temp_file_path.unlink(missing_ok=True)
+
 
     def _create_temp_file(self, code: str, extension: str) -> Path:
         with tempfile.NamedTemporaryFile(

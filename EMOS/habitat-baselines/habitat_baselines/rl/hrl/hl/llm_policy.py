@@ -7,6 +7,7 @@ from habitat.tasks.rearrange.multi_task.pddl_action import PddlAction
 from habitat_mas.agents.actions.arm_actions import *
 from habitat_mas.agents.actions.base_actions import *
 from habitat_mas.agents.crab_agent import CrabAgent
+from habitat_mas.utils.llm_backend import get_llm_backend
 
 # TODO: replace dummy_agent with llm_agent
 from habitat_mas.agents.dummy_agent import DummyAgent
@@ -16,6 +17,17 @@ from habitat_baselines.rl.ppo.policy import PolicyActionData
 from habitat_mas.utils import AgentArguments
 
 ACTION_POOL = [send_request, nav_to_obj, pick, place, reset_arm, wait]
+
+
+def get_llm_actions(action_pool, skill_names, backend):
+    if backend != "qwen":
+        return action_pool
+    executable_action_names = set(skill_names)
+    return [
+        action
+        for action in action_pool
+        if action.name == "send_request" or action.name in executable_action_names
+    ]
 
 
 class LLMHighLevelPolicy(HighLevelPolicy):
@@ -39,7 +51,10 @@ class LLMHighLevelPolicy(HighLevelPolicy):
         #     if action.name in environment_action_name_set
         # ]
         # Initialize the LLM agent
-        self.llm_agent = self._init_llm_agent(kwargs["agent_name"], ACTION_POOL)
+        llm_actions = get_llm_actions(
+            ACTION_POOL, self._skill_name_to_idx, get_llm_backend()
+        )
+        self.llm_agent = self._init_llm_agent(kwargs["agent_name"], llm_actions)
 
     def _init_llm_agent(self, agent_name, action_list):
         # Initialize the LLM agent here based on the config
@@ -147,6 +162,13 @@ class LLMHighLevelPolicy(HighLevelPolicy):
                 continue
 
             action_name = llm_output["name"]
+            if (
+                get_llm_backend() == "qwen"
+                and action_name not in self._skill_name_to_idx
+            ):
+                next_skill[batch_idx] = self._skill_name_to_idx["wait"]
+                skill_args_data[batch_idx] = ["500"]
+                continue
             action_args = self._parse_function_call_args(action_name, llm_output["arguments"])
 
             if action_name in self._skill_name_to_idx:

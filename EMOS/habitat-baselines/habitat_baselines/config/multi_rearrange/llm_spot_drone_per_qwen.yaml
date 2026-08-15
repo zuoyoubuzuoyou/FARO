@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - llm_spot_drone_per
+  - _self_
+
+habitat_baselines:
+  rl:
+    policy:
+      agent_0:
+        hierarchical_policy:
+          ignore_skills:
+            - open_cab
+            - open_fridge
+            - close_cab
+            - close_fridge
+            - pick
+            - pick_at_position
+            - place
+            - place_at_position
+            - reset_arm

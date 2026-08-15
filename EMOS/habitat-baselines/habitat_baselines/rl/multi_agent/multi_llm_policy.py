@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from habitat_mas.agents.actions.discussion_actions import *
 from habitat_mas.utils import AgentArguments
+from habitat_mas.utils.llm_backend import get_llm_backend
 from habitat_mas.utils.models import OpenAIModel
 
 from habitat_baselines.common.storage import Storage
@@ -33,6 +34,16 @@ from habitat_baselines.rl.multi_agent.utils import (
 )
 
 
+QWEN_CODE_EXECUTION = (
+    " Qwen numerical execution contract: Output exactly one self-contained Python code block when numerical verification is needed."
+    " Put all imports first and use only the Python standard library."
+    " Do not put Markdown, yes/no markers, or natural-language conclusions inside the code."
+    " Print only required values as name: value lines and keep the calculation minimal."
+    " After successful execution, return only {{yes}} or {{no||reason}} without another code block."
+    " After failed execution, Correct only the reported error."
+)
+
+
 ROBOT_RESUME_TEMPLATE = (
     '"{robot_key}" is a  "{robot_type}" agent.'
     " It has the following capabilities:\n\n"
@@ -50,7 +61,7 @@ def create_leader_prompt(robot_resume):
         )
     FORMAT_INSTRUCTION = (
         "You should assign subtasks to each agent based on their capabilities, following this format:\n\n"
-        r"{robot_id||subtask_description}\n\n"
+        "{robot_id||subtask_description}\n\n"
         "Remember you must include the brackets and you MUST include ALL the |robots| and |goal conditions| in your response.\n"
         "Even if you think a robot should not assign a subtask, you should assign it with {robot_id||Nothing to do}.\n"
         "Even if you think a robot should assign multiple subtasks, you should combine them into one {robot_id||subtask_description} format.\n"
@@ -103,10 +114,13 @@ def create_robot_prompt(robot_type, robot_key, capabilities, execute_code=True):
     )
 
     if execute_code:
-        return ROBOT_GROUP_DISCUSS_SYSTEM_PROMPT_TEMPLATE.format(
+        prompt = ROBOT_GROUP_DISCUSS_SYSTEM_PROMPT_TEMPLATE.format(
             robot_type=robot_type,
             robot_key=robot_key,
             capabilities=capabilities) + CODE_EXECUTION + FORMAT_INSTRUCTION
+        if get_llm_backend() == "qwen":
+            prompt += QWEN_CODE_EXECUTION
+        return prompt
     else:
         return ROBOT_GROUP_DISCUSS_SYSTEM_PROMPT_TEMPLATE.format(
             robot_type=robot_type,
@@ -193,6 +207,8 @@ def parse_leader_response(text):
 
 
 def parse_agent_response(text):
+    if get_llm_backend() == "qwen":
+        return parse_qwen_agent_response(text)
     # Define the regular expression pattern
     pattern = r"\{(yes|no)(?:\|\|(.*?))?\}"
 
@@ -211,6 +227,42 @@ def parse_agent_response(text):
         )  # Store the reason, strip spaces, or empty if none
 
     return response, reason
+
+
+def parse_qwen_agent_response(text):
+    if not isinstance(text, str):
+        return "no", text
+
+    pattern = re.compile(
+        r"\{+\s*(yes|no)(?:\s*\|\|\s*([^{}]*?))?\s*\}+",
+        re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(text))
+    if matches:
+        match = matches[-1]
+        response = match.group(1).lower()
+        reason = match.group(2)
+        return response, None if response == "yes" else (reason or "").strip()
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("```")
+    ]
+    if lines:
+        final_line = lines[-1].strip("`*_\" ")
+        match = re.fullmatch(
+            r"(yes|no)(?:\s*\|\|\s*(.*))?",
+            final_line,
+            re.IGNORECASE,
+        )
+        if match:
+            response = match.group(1).lower()
+            reason = match.group(2)
+            return response, None if response == "yes" else (reason or "").strip()
+
+    print("No match found in agent response: ", text)
+    return "no", text
 
 
 # DISCUSSION_TOOLS = [eval_python_code, add, subtract, multiply, divide]
@@ -325,6 +377,8 @@ def group_discussion(
     )
     response = leader.chat(leader_start_message)
     robot_tasks = parse_leader_response(response)
+    # 只保留真实机器人 key，过滤掉 LLM 复述模板产生的垃圾 key
+    robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
     print("===============Scene Description==============")
     print(scene_description)
     print("===============Task Description==============")
@@ -341,7 +395,8 @@ def group_discussion(
                 robot_id=agent,
                 robot_type=robot_resume[agent]["robot_type"],
                 task_description=task_description,
-                subtask_description=robot_tasks[agent],
+                # subtask_description=robot_tasks[agent],
+                subtask_description=robot_tasks.get(agent, "Nothing to do"),
                 chat_history=agents[agent].chat_history,
             )
         return results
@@ -380,6 +435,7 @@ def group_discussion(
 
         response = leader.chat(prompt)
         robot_tasks = parse_leader_response(response)
+        robot_tasks = {k: v for k, v in robot_tasks.items() if k in robot_resume}
 
         print("===============Leader Response==============")
         print(response)
@@ -403,7 +459,8 @@ def group_discussion(
             robot_id=agent,
             robot_type=robot_resume[agent]["robot_type"],
             task_description=task_description,
-            subtask_description=robot_tasks[agent],
+            # subtask_description=robot_tasks[agent],
+            subtask_description=robot_tasks.get(agent, "Nothing to do"),
             chat_history=agents[agent].chat_history,
         )
     leader_tokens = leader.token_usage

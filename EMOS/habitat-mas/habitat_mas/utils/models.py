@@ -8,6 +8,8 @@ from .python_interpreter import SubprocessInterpreter
 # from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 from pydantic import BaseModel
 
+from .llm_backend import get_llm_backend
+
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, BaseModel):
@@ -37,7 +39,13 @@ class OpenAIModel:
         self.action_map = {action.name: action for action in action_space}
         self.chat_history = []
         self.window_size = window_size
-        self.model = model
+        self.backend = get_llm_backend()
+        configured_model = os.getenv("EMOS_LLM_MODEL", "").strip()
+        self.model = configured_model or model
+        print(
+            f"LLM compatibility backend: {self.backend}; "
+            f"request model: {self.model}"
+        )
         self.client = openai.OpenAI()
         self.planning_stage = discussion_stage
         self.code_execution = code_execution
@@ -105,6 +113,8 @@ class OpenAIModel:
         self.chat_history.append([new_message])
 
         if self.planning_stage:
+            if self.backend == "qwen" and self.code_execution:
+                return self._chat_qwen_planning(request)
             while True:
                 if self.tool_calls_enable:
                     response = self.client.chat.completions.create(
@@ -194,6 +204,8 @@ class OpenAIModel:
 
             response_message = response.choices[0].message
             self.chat_history[-1].append(response_message)
+            if self.backend == "qwen":
+                return self._parse_qwen_action_response(response_message)
             tool_calls = response_message.tool_calls
             for idx, tool_call in enumerate(tool_calls):
                 self.chat_history[-1].append(
@@ -228,6 +240,117 @@ class OpenAIModel:
         #     function_call_res.append((action_name, parameters))
         # return function_call_res
 
+    def _chat_qwen_planning(self, request):
+        code_attempts = 0
+        while True:
+            request_kwargs = {"messages": list(request), "model": self.model}
+            if self.tool_calls_enable:
+                request_kwargs["tools"] = self.openai_tools
+            response = self.client.chat.completions.create(**request_kwargs)
+            self.token_usage += response.usage.total_tokens
+            response_message = response.choices[0].message
+            self.chat_history[-1].append(response_message)
+            request.append(response_message)
+
+            tool_calls = response_message.tool_calls
+            codes = _extract_code(response_message.content)
+            if self.tool_calls_enable and tool_calls:
+                for tool_call in tool_calls:
+                    tool_call_result = {
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": tool_call.function.name,
+                        "content": self.execute_action(
+                            tool_call.function.name,
+                            json.loads(tool_call.function.arguments),
+                        ),
+                    }
+                    self.chat_history[-1].append(tool_call_result)
+                    request.append(tool_call_result)
+                continue
+
+            merged_code = "\n".join(
+                code_block
+                for code_block, code_type in codes
+                if code_type in self.interpreter._CODE_TYPE_MAPPING
+            )
+            if not merged_code:
+                if self.save_on_each_chat:
+                    self.save_chat_history(self.logging_file)
+                return response_message.content
+
+            if code_attempts >= 3:
+                if self.save_on_each_chat:
+                    self.save_chat_history(self.logging_file)
+                return "{{no||Numerical verification failed after 3 attempts}}"
+            code_attempts += 1
+            result = self.interpreter.run_python_detailed(merged_code)
+            if result.returncode == 0 and not result.timed_out:
+                stdout = result.stdout.strip() or "(no output)"
+                feedback = (
+                    "Python execution succeeded.\n"
+                    f"stdout:\n{stdout}\n"
+                    "Now return only {{yes}} or {{no||reason}} "
+                    "without another code block."
+                )
+            elif code_attempts >= 3:
+                if self.save_on_each_chat:
+                    self.save_chat_history(self.logging_file)
+                return "{{no||Numerical verification failed after 3 attempts}}"
+            elif result.timed_out:
+                feedback = (
+                    "Python execution exceeded 10 seconds. Correct only this error. "
+                    "Do not use loops in the replacement code."
+                )
+            else:
+                error_lines = [
+                    line for line in result.stderr.splitlines() if line.strip()
+                ]
+                error_tail = (
+                    error_lines[-1] if error_lines else "unknown runtime error"
+                )
+                feedback = (
+                    f"Python execution failed: {error_tail}. "
+                    "Correct only the reported error."
+                )
+
+            result_message = {"role": "user", "content": feedback}
+            self.chat_history[-1].append(result_message)
+            request.append(result_message)
+
+    def _parse_qwen_action_response(self, response_message):
+        tool_calls = response_message.tool_calls or []
+        if not tool_calls:
+            if self.save_on_each_chat:
+                self.save_chat_history(self.logging_file)
+            return ("wait", {})
+
+        for idx, tool_call in enumerate(tool_calls):
+            self.chat_history[-1].append(
+                {
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": tool_call.function.name,
+                    "content": (
+                        "Success" if idx == 0 else "Only the first tool call is used"
+                    ),
+                }
+            )
+
+        call = tool_calls[0]
+        if call.function.name not in self.action_map:
+            return ("wait", {})
+        try:
+            parameters = json.loads(call.function.arguments)
+        except (json.JSONDecodeError, TypeError):
+            return ("wait", {})
+        if not isinstance(parameters, dict):
+            return ("wait", {})
+        if self.save_on_each_chat:
+            self.save_chat_history(self.logging_file)
+        return (call.function.name, parameters)
+
+
     def _convert_action_to_schema(self, action_space):
         self.actions = []
         for action in action_space:
@@ -238,6 +361,9 @@ class OpenAIModel:
 def _extract_code(content) -> list[tuple[str, str]]:
     codes = []
     texts = []
+
+    if not content:            # ← 新增这一行
+        return codes           # ← 新增这一行
 
     lines = content.split("\n")
     idx = 0
@@ -254,7 +380,9 @@ def _extract_code(content) -> list[tuple[str, str]]:
         code_type = lines[idx].strip()[3:].strip()
         idx += 1
         start_idx = idx
-        while not lines[idx].lstrip().startswith("```"):
+        # while not lines[idx].lstrip().startswith("```"):
+        #     idx += 1
+        while idx < len(lines) and not lines[idx].lstrip().startswith("```"):
             idx += 1
         code = "\n".join(lines[start_idx:idx]).strip()
         codes.append((code, code_type))
