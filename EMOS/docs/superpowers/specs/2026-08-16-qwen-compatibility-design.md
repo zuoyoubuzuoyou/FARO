@@ -21,6 +21,7 @@ The GPT path must remain the default and retain its current configuration, promp
 
 - The caller currently selects the serving backend through `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
 - The local Qwen server accepts the existing request model name `gpt-5.5`; changing the request model name is not required for this work.
+- The compatibility profile must support the Qwen model family rather than one specific Qwen model. Switching between Qwen model sizes or releases must not require another YAML file or a code change.
 - Numerical reasoning must remain model-generated Python, so replacing it with a deterministic host calculator is outside this design.
 - Qwen compatibility must be explicitly enabled. It must not be inferred from a localhost URL or request model name.
 
@@ -36,10 +37,13 @@ The GPT path must remain the default and retain its current configuration, promp
 Use an explicit runtime profile plus one Hydra overlay:
 
 - `EMOS_LLM_BACKEND` selects the compatibility profile. An unset value means `gpt`; `qwen` enables the compatibility path.
+- `EMOS_LLM_MODEL` optionally selects the request model ID independently of the compatibility profile.
 - `multi_rearrange/llm_spot_drone_per_qwen.yaml` inherits the existing perception configuration and removes manipulation skills only for Qwen runs.
 - Existing Python files receive small conditional Qwen branches. Their GPT branches retain the current behavior.
 
 This approach is preferred over URL detection because a URL does not reliably identify the served model. It is preferred over duplicating the model and policy classes because duplication would make later fixes diverge.
+
+The overlay name uses the model-family label `qwen`, not a versioned name such as `qwen-3.5-9b`. All supported Qwen variants share the same compatibility behavior unless future evidence demonstrates a real protocol difference.
 
 ## Runtime Profile
 
@@ -55,11 +59,21 @@ def get_llm_backend() -> str:
 
 The helper will be used by the model wrapper, multi-agent discussion code, and LLM high-level policy. The selected backend must be logged once near initialization.
 
+The request model ID is resolved separately. Existing callers continue to provide the current `model="gpt-5.5"` default. `OpenAIModel` overrides that request field only when `EMOS_LLM_MODEL` contains a non-empty value:
+
+```python
+configured_model = os.getenv("EMOS_LLM_MODEL", "").strip()
+self.model = configured_model or model
+```
+
+`EMOS_LLM_MODEL` never enables Qwen compatibility by itself. Conversely, `EMOS_LLM_BACKEND=qwen` enables Qwen compatibility even when the server requires the request model alias to remain `gpt-5.5`. This separation is required because an OpenAI-compatible server may expose arbitrary model aliases.
+
 Behavior matrix:
 
 | Behavior | Backend unset / `gpt` | Backend `qwen` |
 | --- | --- | --- |
 | Base Hydra config | Existing file | Qwen overlay |
+| Request model ID | Existing `gpt-5.5` default | `EMOS_LLM_MODEL`, or existing alias if unset |
 | Manipulation skills | Existing behavior | Removed for perception |
 | `ACTION_POOL` | Existing full pool | Filtered by actual skills |
 | Numerical prompt | Existing prompt | Qwen-specific contract |
@@ -214,6 +228,8 @@ unset http_proxy https_proxy all_proxy
 export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="local-qwen"
 export EMOS_LLM_BACKEND="qwen"
+# Optional: set this only when the server requires a concrete model ID.
+export EMOS_LLM_MODEL="qwen-3.5-9b"
 
 python -u -m habitat_baselines.run \
   --config-name=multi_rearrange/llm_spot_drone_per_qwen.yaml \
@@ -227,6 +243,7 @@ GPT:
 export OPENAI_BASE_URL="https://api.labforge.cc/v1"
 export OPENAI_API_KEY="openai_key"
 unset EMOS_LLM_BACKEND
+unset EMOS_LLM_MODEL
 
 python -u -m habitat_baselines.run \
   --config-name=multi_rearrange/llm_spot_drone_per.yaml \
@@ -243,6 +260,9 @@ Use `set -o pipefail` when either command is piped through `tee`.
 - Unset profile resolves to `gpt`.
 - Explicit `qwen` resolves to `qwen`.
 - Unknown values fail at initialization.
+- Two different `EMOS_LLM_MODEL` values under the `qwen` profile select different request model IDs while exercising the same compatibility branches.
+- A Qwen server that requires the alias `gpt-5.5` works with `EMOS_LLM_MODEL` unset.
+- Setting `EMOS_LLM_MODEL` without setting `EMOS_LLM_BACKEND=qwen` changes only the request model field and does not activate Qwen compatibility.
 - GPT snapshots confirm the existing prompt, parser, `ACTION_POOL`, and interpreter output are unchanged.
 
 ### Configuration
@@ -279,6 +299,8 @@ Use `set -o pipefail` when either command is piped through `tee`.
 
 - The original GPT command and YAML require no changes.
 - With `EMOS_LLM_BACKEND` unset, all Qwen compatibility branches are inactive.
+- Changing from one Qwen model to another requires only changing or unsetting `EMOS_LLM_MODEL`; it does not require a new config file or code change.
+- The Qwen overlay and compatibility code contain no version-specific Qwen model name.
 - Qwen numerical execution remains enabled.
 - A Qwen-generated Python error cannot terminate the Habitat evaluation.
 - Qwen cannot select manipulation tools in the perception configuration.
