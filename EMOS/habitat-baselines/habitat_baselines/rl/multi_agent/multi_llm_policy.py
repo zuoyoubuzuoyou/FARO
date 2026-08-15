@@ -239,7 +239,7 @@ def request_qwen_assignment(
     prompt,
     robot_ids,
     goal_objects,
-    max_attempts=3,
+    max_attempts=5,
 ):
     last_violations = ()
     for attempt in range(max_attempts):

@@ -42,6 +42,7 @@ def test_assignment_contract_identifies_real_agents_and_goal_vocabulary():
     assert "do not invent" in contract.lower()
     assert "do not leave" in contract.lower()
     assert "exactly one valid agent" in contract.lower()
+    assert "exactly one required object per valid agent entry" in contract.lower()
 
 
 @pytest.mark.parametrize(
@@ -186,6 +187,7 @@ def test_qwen_leader_retries_invalid_assignment_and_accepts_model_correction():
     correction = leader.chat.call_args_list[1].args[0]
     assert "uncovered goal objects" in correction
     assert "Decide the agent-to-object mapping yourself" in correction
+    assert "exactly one different required object" in correction
 
 
 def test_qwen_leader_exhaustion_never_synthesizes_assignment():
@@ -205,7 +207,7 @@ def test_qwen_leader_exhaustion_never_synthesizes_assignment():
             GOAL_OBJECTS,
         )
 
-    assert leader.chat.call_count == 3
+    assert leader.chat.call_count == 5
 
 
 def test_qwen_perception_base_config_fails_fast():

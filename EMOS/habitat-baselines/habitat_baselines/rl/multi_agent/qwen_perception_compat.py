@@ -57,7 +57,9 @@ def build_assignment_contract(
         f"goal conditions are: {', '.join(goal_objects)}. Assign every required "
         "object to exactly one valid agent. When there are at least as many "
         "required objects as valid agents, do not leave any valid agent without "
-        "at least one required object. TARGET_any_targets|* identifiers are "
+        "at least one required object. When the counts are equal, put exactly "
+        "one required object per valid agent entry and make those objects "
+        "different. TARGET_any_targets|* identifiers are "
         "rearrangement destination markers, not implicit detection goals. Do not "
         "invent agents, sensors, camera poses, field-of-view values, altitudes, "
         "or additional target objects."
@@ -187,6 +189,8 @@ def build_assignment_correction(
         + "\n- ".join(violations)
         + f"\nValid agent IDs: {', '.join(robot_ids)}."
         + f"\nRequired goal objects: {', '.join(goal_objects)}."
+        + "\nWhen agent and goal counts are equal, assign exactly one different "
+        + "required object to each valid agent."
         + "\nReturn a corrected assignment in the required format. Decide the "
         "agent-to-object mapping yourself."
     )
