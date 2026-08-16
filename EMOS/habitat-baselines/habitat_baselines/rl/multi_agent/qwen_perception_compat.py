@@ -11,6 +11,9 @@ DETECTION_GOAL_RE = re.compile(
 )
 OBJECT_ID_RE = re.compile(r"(?:TARGET_)?any_targets\|\d+")
 ASSIGNMENT_RE = re.compile(r"\{([^{}|]+)\|\|([^{}]*)\}")
+SINGLE_PIPE_ASSIGNMENT_RE = re.compile(
+    r"\{([^{}|]+)\|(?!\|)([^{}]*)\}"
+)
 BARE_ASSIGNMENT_RE = re.compile(
     r"^\s*([^{}\n|]+?)\s*\|\|\s*([^{}\n]*?)\s*$",
     re.MULTILINE,
@@ -39,8 +42,10 @@ def extract_object_ids(text: str) -> tuple[str, ...]:
 
 def _assignment_entries(text: str) -> list[tuple[str, str]]:
     entries = ASSIGNMENT_RE.findall(text)
-    unbraced_text = ASSIGNMENT_RE.sub("", text)
-    entries.extend(BARE_ASSIGNMENT_RE.findall(unbraced_text))
+    remaining_text = ASSIGNMENT_RE.sub("", text)
+    entries.extend(SINGLE_PIPE_ASSIGNMENT_RE.findall(remaining_text))
+    remaining_text = SINGLE_PIPE_ASSIGNMENT_RE.sub("", remaining_text)
+    entries.extend(BARE_ASSIGNMENT_RE.findall(remaining_text))
     return [
         (robot_id.strip(), subtask.strip())
         for robot_id, subtask in entries

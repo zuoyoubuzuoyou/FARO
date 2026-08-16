@@ -131,6 +131,41 @@ def test_accepts_complete_assignment_generated_by_the_model():
     ) == ()
 
 
+def test_accepts_qwen_braced_single_pipe_assignment_format():
+    response = (
+        "{agent_0|Detect object any_targets|0}\n"
+        "{agent_1|Detect object any_targets|1}"
+    )
+
+    tasks = parse_qwen_assignment(response)
+
+    assert tasks == {
+        "agent_0": "Detect object any_targets|0",
+        "agent_1": "Detect object any_targets|1",
+    }
+    assert validate_assignment(response, tasks, ROBOT_IDS, GOAL_OBJECTS) == ()
+
+
+def test_single_pipe_assignment_reports_semantics_instead_of_missing_agents():
+    response = (
+        "{agent_0|Detect and rearrange object any_targets|0 to its target location}\n"
+        "{agent_1|Detect and rearrange object any_targets|1 to its target location}"
+    )
+
+    violations = validate_assignment(
+        response,
+        parse_qwen_assignment(response),
+        ROBOT_IDS,
+        GOAL_OBJECTS,
+    )
+
+    assert not any("missing agent IDs" in item for item in violations)
+    assert (
+        "manipulation actions are invalid for detection-only assignments: "
+        "agent_0, agent_1"
+    ) in violations
+
+
 def test_accepts_qwen_braceless_line_assignment_format():
     response = (
         "agent_0||Detect object any_targets|0\n"
