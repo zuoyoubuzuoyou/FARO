@@ -91,7 +91,7 @@ def create_robot_prompt(robot_type, robot_key, capabilities, execute_code=True):
         " You can generate python code to check if task is feasible numerically, but you MUST make sure your code is executable, which means the variables must be defined before referencing them."
         " When considering manipulation task, you only need pay attention to center point, radius, bounding box, etc."
         " I will execute the code and give your the result to help you make decisions."
-        r" Please put all your code in a single python code block wrapped within ```python and ```."
+        r" Must put all your code in a single python code block wrapped within ```python and ```."
         r' You MUST print the varible with "<name>: <value>" format you want to know in the code.'
     )
     FORMAT_INSTRUCTION = (
