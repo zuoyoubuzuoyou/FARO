@@ -1,0 +1,15 @@
+{
+  "faults": [
+    {
+      "fault_id": "F4_missing_subgoal_001",
+      "fault_type": "PlanningFault",
+      "fault_subtype": "MissingSubgoal",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "affected_subtask": "detect target objects",
+      "severity": "high",
+      "expected_recovery": "detect_unsatisfied_precondition_and_replan"
+    }
+  ]
+}

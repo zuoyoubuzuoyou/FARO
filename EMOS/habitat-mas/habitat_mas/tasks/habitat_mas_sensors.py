@@ -19,6 +19,13 @@ from habitat_mas.scene_graph.utils import (
     generate_region_adjacency_description
 )    
 
+
+# Robot configuration files in the released datasets contain this historical
+# name, while the corresponding generated resume is named "head_jaw".
+ROBOT_RESUME_ALIASES = {
+    "SpotRobot_head_arm": "SpotRobot_head_jaw",
+}
+
 @registry.register_sensor
 class HSSDSceneDescriptionSensor(Sensor):
     """Sensor to generate text descriptions of the scene from the environment simulation."""
@@ -138,11 +145,29 @@ class RobotResumeSensor(Sensor):
             # agent_handle = agent_config["agent_type"]
             agent_handle = f"agent_{agent_config['agent_idx']}"
             agent_type = agent_config["agent_type"]
-            robot_resume_file = os.path.join(self.robot_resume_dir, f"{agent_type}.json")
-            if os.path.exists(robot_resume_file):
-                with open(robot_resume_file, "r") as f:
-                    robot_resume = json.load(f, parse_float=lambda x: round(float(x), 2))
-                    robot_resumes[agent_handle] = robot_resume
+            resume_type = ROBOT_RESUME_ALIASES.get(agent_type, agent_type)
+            robot_resume_file = os.path.join(
+                self.robot_resume_dir, f"{resume_type}.json"
+            )
+            if not os.path.exists(robot_resume_file):
+                available_resumes = sorted(
+                    os.path.splitext(file)[0]
+                    for file in os.listdir(self.robot_resume_dir)
+                    if file.endswith(".json")
+                )
+                raise FileNotFoundError(
+                    f"No robot resume found for {agent_type!r} "
+                    f"({agent_handle}). Looked for {robot_resume_file!r}. "
+                    f"Available resumes: {available_resumes}"
+                )
+            with open(robot_resume_file, "r", encoding="utf-8") as f:
+                robot_resume = json.load(
+                    f, parse_float=lambda x: round(float(x), 2)
+                )
+            # Keep the dataset's configured identity while reusing the aliased
+            # capability description.
+            robot_resume["robot_id"] = agent_type
+            robot_resumes[agent_handle] = robot_resume
         
         # convert dict to json string
         robot_resumes_str = json.dumps(robot_resumes)
@@ -322,7 +347,6 @@ if __name__ == "__main__":
 
     fetch_robot_resume = robot_resume_sensor.get_robot_resume("FetchRobot")
     print(fetch_robot_resume)
-    
+
     spot_robot_resume = robot_resume_sensor.get_robot_resume("SpotRobot")
     print(spot_robot_resume)
-    

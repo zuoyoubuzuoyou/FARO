@@ -1,0 +1,16 @@
+{
+  "faults": [
+    {
+      "fault_id": "F6_duplicate_assignment_001",
+      "fault_type": "CoordinationFault",
+      "fault_subtype": "DuplicateAssignment",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_0",
+      "source_agent": "agent_1",
+      "affected_subtask": "agent_1 assigned subtask",
+      "severity": "medium",
+      "expected_recovery": "deduplicate_assignments_and_reallocate"
+    }
+  ]
+}

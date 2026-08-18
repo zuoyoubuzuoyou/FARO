@@ -12,6 +12,7 @@ import gym.spaces as spaces
 import numpy as np
 import torch
 from habitat_mas.agents.actions.discussion_actions import *
+from habitat_mas.fault_injection import TextObservationFaultInjector
 from habitat_mas.utils import AgentArguments
 from habitat_mas.utils.models import OpenAIModel
 
@@ -192,6 +193,14 @@ def parse_leader_response(text):
     return robot_tasks
 
 
+def complete_robot_tasks(robot_tasks, robot_ids):
+    """Return exactly one task for every robot known to the discussion."""
+    return {
+        robot_id: robot_tasks.get(robot_id, "Nothing to do")
+        for robot_id in robot_ids
+    }
+
+
 def parse_agent_response(text):
     # Define the regular expression pattern
     pattern = r"\{(yes|no)(?:\|\|(.*?))?\}"
@@ -228,6 +237,7 @@ def group_discussion(
     robot_resume: dict, 
     scene_description: str, 
     task_description: str, 
+    agent_scene_descriptions: Optional[Dict[str, str]] = None,
     save_chat_history=True, 
     save_chat_history_dir="", 
     episode_id=-1, 
@@ -237,6 +247,9 @@ def group_discussion(
     should_numerical: bool = True,
     max_discussion_rounds = 3,
 ) -> dict[str, AgentArguments]:
+
+    if agent_scene_descriptions is None:
+        agent_scene_descriptions = {}
 
     ### 0. whether save chat history or not
     if save_chat_history:
@@ -324,7 +337,9 @@ def group_discussion(
         scene_description=scene_description
     )
     response = leader.chat(leader_start_message)
-    robot_tasks = parse_leader_response(response)
+    robot_tasks = complete_robot_tasks(
+        parse_leader_response(response), agents.keys()
+    )
     print("===============Scene Description==============")
     print(scene_description)
     print("===============Task Description==============")
@@ -351,7 +366,9 @@ def group_discussion(
         robot_model = agents[robot_id]
         robot_start_message = create_robot_start_message(
             task_description=robot_tasks[robot_id],
-            scene_description=scene_description,
+            scene_description=agent_scene_descriptions.get(
+                robot_id, scene_description
+            ),
             compute_path=compute_path,
         )
         response = robot_model.chat(robot_start_message)
@@ -379,7 +396,9 @@ def group_discussion(
         )
 
         response = leader.chat(prompt)
-        robot_tasks = parse_leader_response(response)
+        robot_tasks = complete_robot_tasks(
+            parse_leader_response(response), agents.keys()
+        )
 
         print("===============Leader Response==============")
         print(response)
@@ -388,7 +407,9 @@ def group_discussion(
             robot_model = agents[robot_id]
             robot_start_message = create_robot_start_message(
                 task_description=robot_tasks[robot_id],
-                scene_description=scene_description,
+                scene_description=agent_scene_descriptions.get(
+                    robot_id, scene_description
+                ),
                 compute_path=compute_path,
             )
             response = robot_model.chat(robot_start_message)
@@ -446,6 +467,10 @@ class MultiLLMPolicy(MultiPolicy):
         self.should_agent_reflection = kwargs.get("should_agent_reflection", True)
         self.should_robot_resume = kwargs.get("should_robot_resume", True)
         self.should_numerical = kwargs.get("should_numerical", True)
+        self.fault_injector = TextObservationFaultInjector.from_config(
+            kwargs.get("fault_injection")
+        )
+        self._reported_faults = set()
         self.ablation_mode = ABLATION_MODE[
             (
                 self.should_group_discussion, 
@@ -457,6 +482,90 @@ class MultiLLMPolicy(MultiPolicy):
 
     def set_active(self, active_policies):
         self._active_policies = active_policies
+
+    def _inject_scene_description(
+        self,
+        scene_description: str,
+        *,
+        episode_id: Any,
+        step: int,
+        observer: str,
+    ) -> str:
+        if self.fault_injector is None:
+            return scene_description
+        result = self.fault_injector.inject(
+            scene_description,
+            episode_id=episode_id,
+            step=step,
+            observer=observer,
+        )
+        self._report_fault_records(result.records, episode_id, step, observer)
+        return result.scene_description
+
+    def _report_fault_records(
+        self, records, episode_id: Any, step: int, observer: str
+    ) -> None:
+        new_fault_ids = []
+        for record in records:
+            report_key = (
+                str(episode_id),
+                int(step),
+                observer,
+                record["fault_id"],
+            )
+            if (
+                record.get("status") == "injected"
+                and report_key not in self._reported_faults
+            ):
+                self._reported_faults.add(report_key)
+                new_fault_ids.append(record["fault_id"])
+        if new_fault_ids:
+            print(
+                f"[FaultInjection] episode={episode_id} step={step} "
+                f"observer={observer} "
+                f"faults={', '.join(new_fault_ids)}"
+            )
+
+    @staticmethod
+    def _requested_skill_name(policy, action_data) -> str:
+        skill_value = action_data.skill_id
+        if skill_value is None:
+            return "unknown"
+        if torch.is_tensor(skill_value):
+            if skill_value.numel() == 0:
+                return "unknown"
+            skill_id = int(skill_value.reshape(-1)[0].item())
+        else:
+            skill_array = np.asarray(skill_value)
+            if skill_array.size == 0:
+                return "unknown"
+            skill_id = int(skill_array.reshape(-1)[0])
+        return policy._idx_to_name.get(skill_id, f"skill_{skill_id}")
+
+    @staticmethod
+    def _force_wait_action(policy, action_data, false_success: bool) -> None:
+        wait_skill_id = policy._name_to_idx["wait"]
+        wait_action_idx = policy._skills[wait_skill_id]._wait_ac_idx
+        env_actions = action_data.env_actions
+        env_actions.zero_()
+        env_actions[:, wait_action_idx] = 1.0
+        if torch.is_tensor(action_data.skill_id):
+            action_data.skill_id.fill_(wait_skill_id)
+        elif isinstance(action_data.skill_id, np.ndarray):
+            action_data.skill_id.fill(wait_skill_id)
+        elif action_data.skill_id is not None:
+            action_data.skill_id = wait_skill_id
+        if false_success:
+            policy._cur_call_high_level.fill_(True)
+
+    @staticmethod
+    def _force_verification_result(policy, action_data, result: bool) -> None:
+        env_actions = action_data.env_actions
+        if result:
+            env_actions.zero_()
+            env_actions[:, policy._stop_action_idx] = 1.0
+        else:
+            env_actions[:, policy._stop_action_idx] = 0.0
 
     def on_envs_pause(self, envs_to_pause):
         for policy in self._active_policies:
@@ -520,6 +629,34 @@ class MultiLLMPolicy(MultiPolicy):
                     scene_description = env_text_context["scene_description"]
                 if "episode_id" in env_text_context:
                     episode_id = env_text_context["episode_id"]
+                episode_step = int(env_text_context.get("step", 0))
+                expected_agent_handles = {
+                    f"agent_{agent_i}" for agent_i in range(n_agents)
+                }
+                resume_agent_handles = set(json.loads(robot_resume))
+                missing_resumes = expected_agent_handles - resume_agent_handles
+                if missing_resumes:
+                    raise ValueError(
+                        "Robot resumes are missing for active policies: "
+                        f"{sorted(missing_resumes)}. Available resumes: "
+                        f"{sorted(resume_agent_handles)}"
+                    )
+                ground_truth_scene_description = scene_description
+                leader_scene_description = self._inject_scene_description(
+                    ground_truth_scene_description,
+                    episode_id=episode_id,
+                    step=episode_step,
+                    observer="leader",
+                )
+                agent_scene_descriptions = {
+                    f"agent_{agent_i}": self._inject_scene_description(
+                        ground_truth_scene_description,
+                        episode_id=episode_id,
+                        step=episode_step,
+                        observer=f"agent_{agent_i}",
+                    )
+                    for agent_i in range(n_agents)
+                }
                 # print("===============Group Discussion===============")
                 # print(robot_resume)
                 # print("=============================================")
@@ -530,8 +667,9 @@ class MultiLLMPolicy(MultiPolicy):
                 
                 agent_arguments = group_discussion(
                     robot_resume, 
-                    scene_description, 
+                    leader_scene_description,
                     text_goal, 
+                    agent_scene_descriptions=agent_scene_descriptions,
                     should_group_discussion=self.should_group_discussion, 
                     should_agent_reflection=self.should_agent_reflection,
                     should_robot_resume=self.should_robot_resume, 
@@ -540,6 +678,25 @@ class MultiLLMPolicy(MultiPolicy):
                     save_chat_history_dir=save_chat_history_dir,
                     episode_id=episode_id,
                 )
+                if self.fault_injector is not None:
+                    assignment_result = self.fault_injector.inject_assignments(
+                        {
+                            agent_handle: arguments.subtask_description
+                            for agent_handle, arguments in agent_arguments.items()
+                        },
+                        episode_id=episode_id,
+                        step=episode_step,
+                    )
+                    for agent_handle, subtask in (
+                        assignment_result.assignments.items()
+                    ):
+                        agent_arguments[agent_handle].subtask_description = subtask
+                    self._report_fault_records(
+                        assignment_result.records,
+                        episode_id,
+                        episode_step,
+                        "assignment",
+                    )
                 envs_agent_arguments.append(agent_arguments)
                 
                 # Invalidate all action policies and flag them to be reinitialized
@@ -549,6 +706,7 @@ class MultiLLMPolicy(MultiPolicy):
 
         # Stage 2: Individual policy actions
         agent_actions = []
+        verification_override = None
         for agent_i, policy in enumerate(self._active_policies):
             # collect assigned tasks for agent_i across all envs
             agent_i_handle = f"agent_{agent_i}"
@@ -558,6 +716,21 @@ class MultiLLMPolicy(MultiPolicy):
                 for arguments in envs_agent_arguments
             ]
             agent_obs = self._update_obs_with_agent_prefix_fn(observations, agent_i)
+            agent_envs_text_context = []
+            for env_text_context in envs_text_context:
+                agent_text_context = dict(env_text_context)
+                if "scene_description" in agent_text_context:
+                    agent_text_context["scene_description"] = (
+                        self._inject_scene_description(
+                            agent_text_context["scene_description"],
+                            episode_id=agent_text_context.get(
+                                "episode_id", "unknown"
+                            ),
+                            step=int(agent_text_context.get("step", 0)),
+                            observer=agent_i_handle,
+                        )
+                    )
+                agent_envs_text_context.append(agent_text_context)
 
             # TODO: Currently, the stage 2 only supports single environment with multiple agents.
             # TODO: Please update the code of agent initialization and policy action to support vectorized environment.
@@ -568,6 +741,11 @@ class MultiLLMPolicy(MultiPolicy):
                 print("=================agent_task_assignment===================")
                 args = select_agent_arguments[0]
                 print(args)
+                if args is None:
+                    raise ValueError(
+                        f"No group-discussion result for {agent_i_handle}. "
+                        "Every active policy must have robot arguments."
+                    )
                 episode_id = envs_text_context[0]["episode_id"]
                 episode_save_dir = os.path.join(save_chat_history_dir, str(episode_id))
                 logging_path = os.path.join(episode_save_dir, f"{agent_i_handle}_action_history.json")
@@ -582,17 +760,55 @@ class MultiLLMPolicy(MultiPolicy):
                 )
 
             # Run the policy
-            agent_actions.append(
-                policy.act(
-                    agent_obs,
-                    agent_rnn_hidden_states[agent_i],
-                    agent_prev_actions[agent_i],
-                    agent_masks[agent_i],
-                    deterministic,
-                    envs_text_context=envs_text_context,
-                    agent_arguments=select_agent_arguments,  # pass the task planning result to the policy
-                )
+            agent_action = policy.act(
+                agent_obs,
+                agent_rnn_hidden_states[agent_i],
+                agent_prev_actions[agent_i],
+                agent_masks[agent_i],
+                deterministic,
+                envs_text_context=agent_envs_text_context,
+                agent_arguments=select_agent_arguments,
             )
+            if self.fault_injector is not None:
+                episode_id = agent_envs_text_context[0].get(
+                    "episode_id", "unknown"
+                )
+                episode_step = int(
+                    agent_envs_text_context[0].get("step", 0)
+                )
+                requested_skill = self._requested_skill_name(
+                    policy, agent_action
+                )
+                control_result = self.fault_injector.inject_control(
+                    episode_id=episode_id,
+                    step=episode_step,
+                    observer=agent_i_handle,
+                    requested_action=requested_skill,
+                )
+                if control_result.force_noop:
+                    self._force_wait_action(
+                        policy, agent_action, control_result.false_success
+                    )
+                if control_result.verification_result is not None:
+                    verification_override = control_result.verification_result
+                self._report_fault_records(
+                    control_result.records,
+                    episode_id,
+                    episode_step,
+                    agent_i_handle,
+                )
+            agent_actions.append(agent_action)
+
+        # Verification is centralized in the MVP. A false-positive result must
+        # set every agent's stop action because RearrangeTask terminates only
+        # when all agent-specific stop actions are asserted.
+        if verification_override is not None:
+            for policy, agent_action in zip(
+                self._active_policies, agent_actions
+            ):
+                self._force_verification_result(
+                    policy, agent_action, verification_override
+                )
 
         if self.should_terminate_on_wait:
             should_terminate = True
@@ -793,6 +1009,13 @@ class MultiLLMPolicy(MultiPolicy):
         kwargs["should_agent_reflection"] = config.habitat.dataset.should_agent_reflection
         kwargs["should_robot_resume"] = config.habitat.dataset.should_robot_resume
         kwargs["should_numerical"] = config.habitat.dataset.should_numerical
+        fault_injection = config.habitat.dataset.fault_injection
+        kwargs["fault_injection"] = {
+            "enabled": fault_injection.enabled,
+            "schedule_path": fault_injection.schedule_path,
+            "log_dir": fault_injection.log_dir,
+            "strict": fault_injection.strict,
+        }
 
         return cls(update_obs_with_agent_prefix_fn, **kwargs)
 

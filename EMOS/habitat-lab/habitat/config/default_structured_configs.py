@@ -17,6 +17,7 @@ __all__ = [
     "HabitatConfig",
     # DATASET
     "DatasetConfig",
+    "FaultInjectionConfig",
     # TASK
     "TaskConfig",
     # ENVIRONMENT
@@ -2181,6 +2182,19 @@ class PyrobotConfig(HabitatBaseConfig):
 
 
 @dataclass
+class FaultInjectionConfig(HabitatBaseConfig):
+    """Configuration for EMOS text-observation fault injection."""
+
+    enabled: bool = False
+    schedule_path: str = ""
+    log_dir: str = "fault_injection_output"
+    strict: bool = True
+    # Optional per-Habitat-step state/action trace. This works even when fault
+    # injection itself is disabled, allowing paired baseline/fault runs.
+    trajectory_log_dir: str = ""
+
+
+@dataclass
 class DatasetConfig(HabitatBaseConfig):
     r"""Configuration for the dataset of the task.
 
@@ -2210,6 +2224,9 @@ class DatasetConfig(HabitatBaseConfig):
     should_agent_reflection: bool = True
     should_robot_resume: bool = True
     should_numerical: bool = True
+    fault_injection: FaultInjectionConfig = field(
+        default_factory=FaultInjectionConfig
+    )
 
 
 @dataclass

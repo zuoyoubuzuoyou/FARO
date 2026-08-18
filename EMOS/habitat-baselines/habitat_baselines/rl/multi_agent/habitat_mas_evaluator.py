@@ -25,6 +25,7 @@ from habitat_baselines.utils.common import (
     is_continuous_action_space,
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info
+from habitat_mas.fault_injection.trajectory import TrajectoryRecorder
 
 class HabitatMASEvaluator(Evaluator):
     """
@@ -44,6 +45,14 @@ class HabitatMASEvaluator(Evaluator):
         env_spec,
         rank0_keys,
     ):
+        trajectory_log_dir = str(
+            config.habitat.dataset.fault_injection.trajectory_log_dir
+        ).strip()
+        trajectory_recorder = (
+            TrajectoryRecorder(trajectory_log_dir)
+            if trajectory_log_dir
+            else None
+        )
         observations = envs.reset()
         observations = envs.post_step(observations)
         batch = batch_obs(observations, device=device)
@@ -138,6 +147,7 @@ class HabitatMASEvaluator(Evaluator):
         pbar = tqdm.tqdm(total=number_of_eval_episodes * evals_per_ep)
         agent.eval()
         cur_ep_id = -1
+        cur_ep_step = 0
         while (
             len(stats_episodes) < (number_of_eval_episodes * evals_per_ep)
             and envs.num_envs > 0
@@ -148,11 +158,17 @@ class HabitatMASEvaluator(Evaluator):
             # Then collect the context of the episode
             if current_episodes_info[0].episode_id != cur_ep_id:
                 cur_ep_id = current_episodes_info[0].episode_id
+                cur_ep_step = 0
                 print("===============================================================================")
                 print("=================================Episode ID====================================")
                 print("Current Episode ID: ", cur_ep_id)
                 print("=================================Episode ID====================================")
                 print("===============================================================================")
+                if trajectory_recorder is not None:
+                    for episode_info in current_episodes_info:
+                        trajectory_recorder.start_episode(
+                            episode_info.episode_id, episode_info.scene_id
+                        )
                 envs_text_context = envs.call(["get_task_text_context"] * envs.num_envs)
                 if 'pddl_text_goal' in batch:
                     envs_pddl_text_goal_np = batch['pddl_text_goal'].cpu().numpy()
@@ -163,6 +179,9 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+
+            for i in range(envs.num_envs):
+                envs_text_context[i]["step"] = cur_ep_step
 
             space_lengths = {}
             n_agents = len(config.habitat.simulator.agents)
@@ -180,6 +199,20 @@ class HabitatMASEvaluator(Evaluator):
                     deterministic=False,
                     envs_text_context=envs_text_context,
                     **space_lengths,
+                )
+                pending_trajectory_steps = (
+                    [
+                        trajectory_recorder.make_step(
+                            episode_id=current_episodes_info[i].episode_id,
+                            step=cur_ep_step,
+                            batch=batch,
+                            env_index=i,
+                            action_data=action_data,
+                        )
+                        for i in range(envs.num_envs)
+                    ]
+                    if trajectory_recorder is not None
+                    else None
                 )
                 if action_data.should_inserts is None:
                     test_recurrent_hidden_states = (
@@ -208,10 +241,20 @@ class HabitatMASEvaluator(Evaluator):
                 step_data = [a.item() for a in action_data.env_actions.cpu()]
 
             outputs = envs.step(step_data)
+            cur_ep_step += 1
 
             observations, rewards_l, dones, infos = [
                 list(x) for x in zip(*outputs)
             ]
+            if trajectory_recorder is not None:
+                for i, trajectory_step in enumerate(pending_trajectory_steps):
+                    trajectory_recorder.finish_step(
+                        trajectory_step,
+                        episode_id=current_episodes_info[i].episode_id,
+                        reward=rewards_l[i],
+                        done=dones[i],
+                        info=infos[i],
+                    )
             # Note that `policy_infos` represents the information about the
             # action BEFORE `observations` (the action used to transition to
             # `observations`).

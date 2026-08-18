@@ -29,6 +29,13 @@ class OpenAIModel:
         save_on_each_chat=True,
         agent_name="unknown",
     ) -> None:
+        # Initialize logging fields before constructing the API client. Client
+        # construction can fail (for example, when proxy extras are missing),
+        # and __del__ must still be safe for a partially initialized instance.
+        self.enable_logging = enable_logging
+        self.logging_file = logging_file
+        self.save_on_each_chat = save_on_each_chat
+        self.agent_name = agent_name
         self.system_message = {
             "role": "system",
             "content": system_prompt,
@@ -51,17 +58,17 @@ class OpenAIModel:
         self.tool_calls_enable = True if action_space else False
         self.token_usage = 0
         
-        # Debug logging
-        self.enable_logging = enable_logging
-        self.logging_file = logging_file
-        self.save_on_each_chat = save_on_each_chat
-        self.agent_name = agent_name
-
-    
     def __del__(self):
         """Save chat history to a file if logging is enabled"""
-        if self.enable_logging:
-            self.save_chat_history(self.logging_file)
+        if getattr(self, "enable_logging", False) and getattr(
+            self, "logging_file", ""
+        ):
+            try:
+                self.save_chat_history(self.logging_file)
+            except Exception:
+                # Exceptions raised from __del__ cannot be handled by callers
+                # and only obscure the original initialization/runtime error.
+                pass
            
     def save_chat_history(self, file_path: str):
 

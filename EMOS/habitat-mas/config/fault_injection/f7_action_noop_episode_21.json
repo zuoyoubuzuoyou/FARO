@@ -1,0 +1,16 @@
+{
+  "faults": [
+    {
+      "fault_id": "F7_action_noop_001",
+      "fault_type": "ActionFault",
+      "fault_subtype": "ActionNoOpOrFalseSuccess",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "affected_subtask": "first selected action",
+      "false_success": true,
+      "severity": "high",
+      "expected_recovery": "verify_world_state_and_retry_action"
+    }
+  ]
+}

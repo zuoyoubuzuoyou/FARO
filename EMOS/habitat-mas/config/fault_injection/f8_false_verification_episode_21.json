@@ -1,0 +1,16 @@
+{
+  "faults": [
+    {
+      "fault_id": "F8_false_verification_001",
+      "fault_type": "VerificationFault",
+      "fault_subtype": "MissingOrFalseVerification",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "affected_subtask": "episode completion",
+      "verification_mode": "false_positive",
+      "severity": "high",
+      "expected_recovery": "cross_agent_verification_or_reobserve"
+    }
+  ]
+}

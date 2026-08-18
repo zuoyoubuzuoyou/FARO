@@ -1,0 +1,16 @@
+{
+  "faults": [
+    {
+      "fault_id": "F3_wrong_subgoal_001",
+      "fault_type": "PlanningFault",
+      "fault_subtype": "WrongSubgoal",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "affected_subtask": "detect target objects",
+      "wrong_subgoal": "Navigate to and detect 072-d_toy_airplane_:0000 only",
+      "severity": "high",
+      "expected_recovery": "replan_or_reject_subgoal"
+    }
+  ]
+}

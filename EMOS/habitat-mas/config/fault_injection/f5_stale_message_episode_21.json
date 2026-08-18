@@ -1,0 +1,15 @@
+{
+  "faults": [
+    {
+      "fault_id": "F5_stale_message_001",
+      "fault_type": "CommunicationFault",
+      "fault_subtype": "MessageDelayOrStale",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "stale_message": "The target can has already been detected near the table.",
+      "severity": "medium",
+      "expected_recovery": "request_fresh_message_or_cross_check"
+    }
+  ]
+}

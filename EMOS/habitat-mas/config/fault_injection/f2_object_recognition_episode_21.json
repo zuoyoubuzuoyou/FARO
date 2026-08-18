@@ -1,0 +1,16 @@
+{
+  "faults": [
+    {
+      "fault_id": "F2_object_recognition_001",
+      "fault_type": "PerceptionFault",
+      "fault_subtype": "ObjectRecognitionError",
+      "episode_id": "21",
+      "injected_at_step": 0,
+      "faulty_agent": "agent_1",
+      "affected_object": "002_master_chef_can_:0000",
+      "observed_object": "003_cracker_box_:0000",
+      "severity": "medium",
+      "expected_recovery": "reobserve_object_or_ask_teammate"
+    }
+  ]
+}
