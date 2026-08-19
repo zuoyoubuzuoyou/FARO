@@ -1,11 +1,48 @@
 # @package _global_
+# 上面的意思是说不要额外添加包路径前缀，直接把这个文件的字段放到最终 Hydra 配置树最外层。
+# Spot + Drone 感知实验的 Habitat 环境配置。它不负责定义 LLM，而是负责定义：
+# - 使用什么机器人
+# - 每个机器人有哪些底层动作和传感器
+# - 怎样计算成功、奖励和碰撞
+# - 使用哪个 PDDL 任务
+# - 从哪个数据集读取 episode
+# - 仿真最多运行多少步
+# llm_spot_drone_per.yaml
+# └── config_spot_drone_per.yaml       ← 当前文件：环境与任务配置
+#     ├── pddl_spot_drone_per.yaml     ← PDDL 成功条件
+#     ├── two_agent_perception_eval.json.gz
+#     └── two_agent_perception_eval.json
 
+#defaults 是 Hydra 的“配置组合清单”。它告诉 Hydra：在读取当前 YAML 内容之前，还要加载哪些基础配置或配置模块。
 defaults:
   - /habitat: habitat_config_base
+  #从 habitat 配置组中加载 habitat_config_base，它不是普通 YAML 文件，而是在 Python 中注册的结构化配置：‘default_structured_configs.py’，定义了 Habitat 环境的基本配置。
   - /habitat/task: task_config_base
+#从 habitat/task 配置组加载 task_config_base，放到 habitat.task 节点，同样在 Python 中注册
+#cs.store(
+#     package="habitat.task",
+#     group="habitat/task",
+#     name="task_config_base",
+#     node=TaskConfig,
+# )
+# TaskConfig 提供任务相关的默认字段，例如：
+# habitat:
+#   task:
+#     type: Nav-v0
+#     reward_measure: null
+#     success_measure: null
+#     success_reward: 2.5
+#     slack_reward: -0.01
+#     end_on_success: false
+#     lab_sensors: {}
+#     measurements: {}
+#     constraint_violation_ends_episode: true
+#     constraint_violation_drops_object: false
+# 然后当前文件再覆盖这些默认值
 
   - /habitat/simulator/agents/habitat_mas_agents@habitat.simulator.agents.agent_0: SpotRobot_head_jaw
   - /habitat/simulator/agents/habitat_mas_agents@habitat.simulator.agents.agent_1: DJIDrone_default
+# 加载两个机器人配置：SpotRobot_head_jaw 和 DJIDrone_default，分别放到 habitat.simulator.agents.agent_0 和 habitat.simulator.agents.agent_1 节点。llm_spot_drone_per.yaml继承了当前的文件，所以运行 llm_spot_drone_per.yaml 时，这个环境配置会自动生效。
 
   - /habitat/dataset/embodied_mas: dataset_perception
 
@@ -18,6 +55,12 @@ defaults:
   - /habitat/task/actions@habitat.task.actions.agent_0_oracle_nav_coord_action: oracle_nav_coord_action
   - /habitat/task/actions@habitat.task.actions.agent_0_arm_reset_action: arm_reset_action
   - /habitat/task/actions@habitat.task.actions.agent_0_wait: wait
+# Spot 的动作定义因此 Spot 可以：
+# - 移动
+# - Oracle 导航
+# - 抓取和放置
+# - 重置机械臂
+# - 等待或停止
 
   - /habitat/task/actions@habitat.task.actions.agent_1_base_velocity: drone_base_velocity
   - /habitat/task/actions@habitat.task.actions.agent_1_rearrange_stop: rearrange_stop
@@ -25,15 +68,22 @@ defaults:
   - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_action: drone_oracle_nav_action
   - /habitat/task/actions@habitat.task.actions.agent_1_oracle_nav_coord_action: oracle_nav_coord_action
   - /habitat/task/actions@habitat.task.actions.agent_1_wait: wait
+# Drone 的动作定义
+
+# 评估指标，视频中的这些指标就来自这里。
+# 评估指标，例如 pddl_success、num_steps、did_agents_collide 等，都是在 habitat/task/measurements 中定义的。它们会被 HabitatMASEvaluator 读取并计算。
+# 表示从 Hydra 配置根目录中的 habitat/task/measurements 配置组查找配置。
+# - 开头 /：从 Hydra 配置搜索路径根部开始
 
   - /habitat/task/measurements:
-    - pddl_success
-    - num_steps
-    - did_agents_collide
-    - num_agents_collide
-    - composite_stage_goals
-    - pddl_subgoal_reward
-    - rearrange_cooperate_reward
+    - pddl_success # 最终 PDDL 目标是否成立
+    - num_steps #episode 执行步数
+    - did_agents_collide # 机器人是否发生碰撞
+    - num_agents_collide # 机器人发生碰撞的次数
+    - composite_stage_goals # PDDL 阶段目标是否曾经完成
+    - pddl_subgoal_reward # 完成阶段目标产生的奖励
+    - rearrange_cooperate_reward # 多机器人协作奖励
+  # 配置了任务传感器
   - /habitat/task/lab_sensors:
     - relative_resting_pos_sensor
     - target_start_sensor
@@ -43,10 +93,10 @@ defaults:
     - end_effector_sensor
     - target_start_gps_compass_sensor
     - target_goal_gps_compass_sensor
-    - localization_sensor
-    - other_agent_gps
-    - detected_objects_sensor
-    - pddl_text_goal
+    - localization_sensor # 自身定位信息
+    - other_agent_gps # 其他机器人的相对位置
+    - detected_objects_sensor # 当前检测到的目标物体
+    - pddl_text_goal # 把PDDL目标转换成文本，提供给 LLM
     #- arm_workspace_rgb_sensor
     #- object_masks_sensor
     #- nav_workspace_rgb_sensor
@@ -54,6 +104,7 @@ defaults:
     #- nav_workspace_points_sensor
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_0_agents_within_threshold: agents_within_threshold
   - /habitat/task/lab_sensors@habitat.task.lab_sensors.agent_1_agents_within_threshold: agents_within_threshold
+  # 为两个机器人分别配置了，用于判断机器人之间是否处于指定距离范围内，并作为部分高层技能的终止观测，阈值为：x_len: 2.0，y_len: 1.5
   - _self_
 
 habitat:
@@ -70,36 +121,37 @@ habitat:
     type: RearrangePddlTask-v0
     reward_measure: rearrange_cooperate_reward
     success_measure: pddl_success
-    success_reward: 10.0
+    success_reward: 10.0 # 成功时奖励
     min_distance_start_agents: 5.0
-    slack_reward: -0.0005
-    end_on_success: True
-    constraint_violation_ends_episode: False
-    constraint_violation_drops_object: True
+    slack_reward: -0.0005 # 每步惩罚，鼓励尽快完成任务
+    end_on_success: True # 成功时结束episode
+    constraint_violation_ends_episode: False # 约束违规不会直接结束 episode（不是指机器人碰撞，而是“抓持约束违规”，即机器人在抓取物体时违反了约束条件，比如：被抓物体与机械臂异常分离），而是继续执行，方便训练和评估
+    constraint_violation_drops_object: True # 如果机器人拿着物体，碰撞时可能会掉落物体
     measurements:
       pddl_success:
-        must_call_stop: False
+        must_call_stop: False # 不要求机器人额外执行 stop；只要 PDDL 条件成立就能成功
       rearrange_cooperate_reward:
-        stage_sparse_reward: 5.0
-        end_on_collide: True
+        stage_sparse_reward: 5.0 # 每个阶段目标完成时的奖励
+        end_on_collide: True # 碰撞（两个机器人之间发生物理接触）时结束episode
         collide_penalty: 0.5
     task_spec_base_path: benchmark/multi_agent/
-    task_spec: pddl/pddl_spot_drone_per
-    pddl_domain_def: fp
+    task_spec: pddl/pddl_spot_drone_per # 其中定义了当前任务的最终目标
+    pddl_domain_def: fp # 指定通用 PDDL domain，提供 is_detected、detected_object、导航等谓词和动作语义
     robot_at_thresh: 1.0
 
   environment:
-    max_episode_steps: 750
-  simulator:
+    max_episode_steps: 750 # 每个任务最多运行 750 个仿真步。
+
+  simulator: # 仿真器配置
     type: RearrangeSim-v0
-    seed: 100
+    seed: 100 # 随机种子，保证每次运行的随机性一致
     additional_object_paths:
       - "data/objects/ycb/configs/"
       - "data/objects/amazon_berkeley/configs/"
       - "data/objects/google_object_dataset/configs/"
     concur_render: True
     auto_sleep: True
-    agents_order:
+    agents_order: # 指定两个机器人在仿真器中的执行顺序，agent_0 先执行，agent_1 后执行
       - agent_0
       - agent_1
 

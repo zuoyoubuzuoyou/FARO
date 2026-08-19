@@ -1,5 +1,14 @@
 # Since two objects are both far beyond spot's perception
 # The oracle solution should be assigning spot to detect both objects.
+
+#PDDL 是 Planning Domain Definition Language，中文通常叫“规划领域定义语言”。
+# 它是一种给自动规划系统描述任务的语言，主要说明三件事：
+# - 世界里有什么：机器人、物体、位置
+# - 可以执行什么动作：导航、抓取、放置、检测
+# - 最终要满足什么条件
+# 在你的 Habitat 项目中，PDDL 相当于仿真任务的“形式化规则和判分标准”
+# Spot + Drone 协作感知任务的任务规格文件。它定义参与实体、最终成功条件、阶段性指标和参考动作序列
+
 objects:
   - name: agent_0
     expr_type: robot_entity_type
@@ -16,6 +25,8 @@ objects:
 
 goal:
   expr_type: AND
+  #两个物体必须在同一时刻处于被某个机器人检测到的状态。任务不要求抓取或移动物体，只要求视觉检测。pddl_success 的判定依据。这里没有指定机器人，因此 Spot 或 Drone 检测到都可以。关键在于评估当前状态时，两个目标需要同时处于已检测状态。
+
   sub_exprs:
     # - detected_object(any_targets|1, agent_1)
     - is_detected(any_targets|1)
