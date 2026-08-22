@@ -591,6 +591,10 @@ class MultiLLMPolicy(MultiPolicy):
                     deterministic,
                     envs_text_context=envs_text_context,
                     agent_arguments=select_agent_arguments,  # pass the task planning result to the policy
+                    object_localization_fault=kwargs.get(
+                        "object_localization_fault"
+                    ),
+                    simulator_steps=kwargs.get("simulator_steps"),
                 )
             )
 
@@ -611,6 +615,12 @@ class MultiLLMPolicy(MultiPolicy):
         policy_info = _merge_list_dict(
             [ac.policy_info for ac in agent_actions]
         )
+        for env_i in range(n_envs):
+            for agent_i, policy in enumerate(self._active_policies):
+                current_skill_idx = int(policy._cur_skills[env_i].item())
+                policy_info[env_i][f"agent_{agent_i}_current_skill"] = (
+                    policy._idx_to_name[current_skill_idx]
+                )
         batch_size = masks.shape[0]
         device = masks.device
 

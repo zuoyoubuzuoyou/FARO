@@ -105,6 +105,14 @@ class RLTaskEnv(habitat.RLEnv):
         )
         return self._env.task.get_task_text_context()
 
+    def get_trajectory_state(self) -> dict:
+        """Return a compact, JSON-friendly ground-truth task state."""
+
+        assert hasattr(self._env.task, "get_trajectory_state"), (
+            "The task does not have a get_trajectory_state method."
+        )
+        return self._env.task.get_trajectory_state()
+
 
 @habitat.registry.register_env(name="GymRegistryEnv")
 class GymRegistryEnv(gym.Wrapper):

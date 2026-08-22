@@ -459,6 +459,68 @@ class RearrangeTask(NavigationTask):
             robot_config = self._robot_config[current_episode_idx]["agents"]
         return get_text_context(self._sim, robot_config)
 
+    def get_trajectory_state(self) -> dict:
+        """Return compact ground truth needed to reconstruct a task path.
+
+        This is intentionally an observation-only export. It does not mutate
+        the simulator and is not intended to be passed to ``set_state``.
+        """
+
+        agents = []
+        for agent_idx, agent_name in enumerate(
+            self._sim.agents_mgr.agents_order
+        ):
+            agent_data = self._sim.get_agent_data(agent_idx)
+            articulated_agent = agent_data.articulated_agent
+            agents.append(
+                {
+                    "agent": str(agent_name),
+                    "position": np.asarray(
+                        articulated_agent.base_pos, dtype=float
+                    ).tolist(),
+                    "rotation": float(articulated_agent.base_rot),
+                    "held_object_id": agent_data.grasp_mgr.snap_idx,
+                }
+            )
+
+        relative_index_to_handle = {}
+        for handle, relative_index in self._sim.handle_to_object_id.items():
+            relative_index_to_handle.setdefault(relative_index, handle)
+        rigid_object_manager = self._sim.get_rigid_object_manager()
+        rigid_objects = []
+        for relative_index, object_id in enumerate(self._sim.scene_obj_ids):
+            rigid_object = rigid_object_manager.get_object_by_id(object_id)
+            rigid_objects.append(
+                {
+                    "object_id": int(object_id),
+                    "handle": str(
+                        relative_index_to_handle.get(
+                            relative_index, rigid_object.handle
+                        )
+                    ),
+                    "position": np.asarray(
+                        rigid_object.translation, dtype=float
+                    ).tolist(),
+                }
+            )
+
+        articulated_objects = [
+            {
+                "handle": str(articulated_object.handle),
+                "joint_positions": np.asarray(
+                    articulated_object.joint_positions, dtype=float
+                ).tolist(),
+            }
+            for articulated_object in self._sim.art_objs
+        ]
+
+        return {
+            "task_step": int(self._cur_episode_step),
+            "agents": agents,
+            "rigid_objects": rigid_objects,
+            "articulated_objects": articulated_objects,
+        }
+
     @property
     def should_end(self) -> bool:
         return self._should_end

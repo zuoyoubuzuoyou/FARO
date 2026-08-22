@@ -7,6 +7,10 @@ from habitat.tasks.rearrange.multi_task.pddl_action import PddlAction
 from habitat_mas.agents.actions.arm_actions import *
 from habitat_mas.agents.actions.base_actions import *
 from habitat_mas.agents.crab_agent import CrabAgent
+from habitat_mas.fault_injection.object_localization import (
+    ObjectLocalizationFaultSpec,
+    inject_object_localization_error,
+)
 
 # TODO: replace dummy_agent with llm_agent
 from habitat_mas.agents.dummy_agent import DummyAgent
@@ -28,6 +32,7 @@ class LLMHighLevelPolicy(HighLevelPolicy):
         self._all_actions = self._setup_actions()
         self._n_actions = len(self._all_actions)
         self._active_envs = torch.zeros(self._num_envs, dtype=torch.bool)
+        self._decision_steps = [0 for _ in range(self._num_envs)]
 
         # environment_action_name_set = set(
         #     [action._name for action in self._all_actions]
@@ -68,6 +73,9 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             mask: Binary mask of shape (num_envs, ) to be applied to the agents.
         """
         self._active_envs = mask
+        for env_index, is_active in enumerate(mask.bool().view(-1).tolist()):
+            if not is_active:
+                self._decision_steps[env_index] = 0
 
     def get_next_skill(
         self,
@@ -111,20 +119,16 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             'Ensure that all required parameters are included and correctly formatted.'
         )
 
-        semantic_observation = envs_text_context[0]["scene_description"]
-        # print(semantic_observation)
-        if not self.llm_agent.start_act:
-            get_next_action_message = start_action_prompt.format(
-                scene_description=semantic_observation
-            )
-            self.llm_agent.start_act = True
-        else:
-            get_next_action_message = step_action_prompt
-
         batch_size = masks.shape[0]
         next_skill = torch.zeros(batch_size)
         skill_args_data = [None for _ in range(batch_size)]
         immediate_end = torch.zeros(batch_size, dtype=torch.bool)
+        decision_info = [{} for _ in range(batch_size)]
+
+        fault_spec = ObjectLocalizationFaultSpec.from_config(
+            kwargs.get("object_localization_fault")
+        )
+        simulator_steps = kwargs.get("simulator_steps")
 
         assert self.llm_agent.initialized, "Exception in LLMHighLevelPolicy.get_next_skill(): LLM agent not initialized."
 
@@ -132,9 +136,73 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             if should_plan != 1.0:
                 continue
 
+            decision_step = self._decision_steps[batch_idx]
+            env_text_context = envs_text_context[batch_idx]
+            episode_id = env_text_context.get("episode_id", "")
+            semantic_observation = env_text_context["scene_description"]
+            simulator_step = (
+                None
+                if simulator_steps is None
+                else int(simulator_steps[batch_idx])
+            )
+            fault_event = None
+            if fault_spec.matches(
+                episode_id=episode_id,
+                agent=self._agent_name,
+                decision_step=decision_step,
+            ):
+                semantic_observation, fault_event = (
+                    inject_object_localization_error(
+                        semantic_observation,
+                        fault_spec,
+                        episode_id=episode_id,
+                        agent=self._agent_name,
+                        decision_step=decision_step,
+                        simulator_step=simulator_step,
+                    )
+                )
+
+            if not self.llm_agent.start_act:
+                get_next_action_message = start_action_prompt.format(
+                    scene_description=semantic_observation
+                )
+                self.llm_agent.start_act = True
+            elif fault_event is not None:
+                injected_facts = "\n".join(
+                    change["fact_after"]
+                    for change in fault_event["changes"]
+                )
+                get_next_action_message = (
+                    step_action_prompt
+                    + '\nYour perception module reports this current '
+                    'object-location update: """\n'
+                    + injected_facts
+                    + '\n"""'
+                )
+            else:
+                get_next_action_message = step_action_prompt
+
             # Query the LLM agent with the current observations
             # to get the next action and arguments
             llm_output = self.llm_agent.chat(get_next_action_message)
+            self._decision_steps[batch_idx] += 1
+            decision_event = {
+                "type": "high_level_decision",
+                "episode_id": str(episode_id),
+                "agent": self._agent_name,
+                "decision_step": int(decision_step),
+                "simulator_step": simulator_step,
+                "input_variant": (
+                    "faulty" if fault_event is not None else "clean"
+                ),
+                "prompt": get_next_action_message,
+                # This is the symbolic scene context available at the decision
+                # boundary. The prompt contains it on the first decision and
+                # contains the injected update on a later faulty decision.
+                "symbolic_scene_context": semantic_observation,
+            }
+            if fault_event is not None:
+                decision_info[batch_idx]["fault_event"] = fault_event
             print("=================llm_output===================")
             print("Agent: ", self.llm_agent.name)
             print(llm_output)
@@ -144,10 +212,32 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             if llm_output is None:
                 next_skill[batch_idx] = self._skill_name_to_idx["wait"]
                 skill_args_data[batch_idx] = ["500"]
+                decision_event["resulting_decision"] = {
+                    "action": None,
+                    "arguments": None,
+                }
+                if fault_event is not None:
+                    fault_event["resulting_decision"] = {
+                        "action": None,
+                        "arguments": None,
+                    }
+                    decision_event["fault_event"] = fault_event
+                decision_info[batch_idx]["decision_event"] = decision_event
                 continue
 
             action_name = llm_output["name"]
             action_args = self._parse_function_call_args(action_name, llm_output["arguments"])
+            decision_event["resulting_decision"] = {
+                "action": action_name,
+                "arguments": llm_output["arguments"],
+            }
+            if fault_event is not None:
+                fault_event["resulting_decision"] = {
+                    "action": action_name,
+                    "arguments": llm_output["arguments"],
+                }
+                decision_event["fault_event"] = fault_event
+            decision_info[batch_idx]["decision_event"] = decision_event
 
             if action_name in self._skill_name_to_idx:
                 next_skill[batch_idx] = self._skill_name_to_idx[action_name]
@@ -161,5 +251,5 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             next_skill,
             skill_args_data,
             immediate_end,
-            PolicyActionData(),
+            PolicyActionData(policy_info=decision_info),
         )

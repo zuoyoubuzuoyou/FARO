@@ -42,7 +42,15 @@ def extract_scalars_from_info(
         # Things that are scalar-like will have an np.size of 1.
         # Strings also have an np.size of 1, so explicitly ban those
         elif np.size(v) == 1 and not isinstance(v, str):
-            result[k] = float(v)
+            # A one-element container is not necessarily a scalar.  Policy
+            # metadata can contain values such as action arguments ["500"],
+            # which NumPy reports as size 1 but float() cannot convert.  Such
+            # structured values belong in trajectory/debug output, not in the
+            # flattened scalar metrics used for evaluation summaries.
+            try:
+                result[k] = float(v)
+            except (TypeError, ValueError):
+                continue
 
     return result
 

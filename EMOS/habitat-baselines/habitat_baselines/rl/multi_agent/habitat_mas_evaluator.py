@@ -25,6 +25,12 @@ from habitat_baselines.utils.common import (
     is_continuous_action_space,
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info
+from habitat_mas.fault_injection.object_localization import (
+    FaultEventRecorder,
+    FaultInjectionError,
+)
+from habitat_mas.fault_injection.trajectory import TrajectoryRecorder
+
 
 class HabitatMASEvaluator(Evaluator):
     """
@@ -44,6 +50,31 @@ class HabitatMASEvaluator(Evaluator):
         env_spec,
         rank0_keys,
     ):
+        object_localization_fault = (
+            config.habitat_baselines.fault_injection.object_localization
+        )
+        fault_recorder = (
+            FaultEventRecorder(
+                object_localization_fault.output_dir,
+                object_localization_fault.run_label,
+            )
+            if object_localization_fault.enabled
+            else None
+        )
+        trajectory_recorder = (
+            TrajectoryRecorder(
+                object_localization_fault.output_dir,
+                object_localization_fault.run_label,
+                mode=(
+                    "faulty"
+                    if object_localization_fault.enabled
+                    else "clean"
+                ),
+            )
+            if object_localization_fault.record_trajectory
+            else None
+        )
+        simulator_steps = [0 for _ in range(envs.num_envs)]
         observations = envs.reset()
         observations = envs.post_step(observations)
         batch = batch_obs(observations, device=device)
@@ -163,6 +194,12 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+                    if trajectory_recorder is not None:
+                        trajectory_recorder.record_episode_start(
+                            episode_id=current_episodes_info[i].episode_id,
+                            scene_id=current_episodes_info[i].scene_id,
+                            text_context=envs_text_context[i],
+                        )
 
             space_lengths = {}
             n_agents = len(config.habitat.simulator.agents)
@@ -179,6 +216,8 @@ class HabitatMASEvaluator(Evaluator):
                     not_done_masks,
                     deterministic=False,
                     envs_text_context=envs_text_context,
+                    object_localization_fault=object_localization_fault,
+                    simulator_steps=simulator_steps,
                     **space_lengths,
                 )
                 if action_data.should_inserts is None:
@@ -190,6 +229,15 @@ class HabitatMASEvaluator(Evaluator):
                     agent.actor_critic.update_hidden_state(
                         test_recurrent_hidden_states, prev_actions, action_data
                     )
+
+            if (
+                fault_recorder is not None
+                and action_data.policy_info is not None
+            ):
+                for policy_info in action_data.policy_info:
+                    for key, value in policy_info.items():
+                        if key.endswith("_fault_event"):
+                            fault_recorder.record(value)
 
             # NB: Move actions to CPU.  If CUDA tensors are
             # sent in to env.step(), that will create CUDA contexts
@@ -207,6 +255,11 @@ class HabitatMASEvaluator(Evaluator):
             else:
                 step_data = [a.item() for a in action_data.env_actions.cpu()]
 
+            world_states_before = (
+                envs.call(["get_trajectory_state"] * envs.num_envs)
+                if trajectory_recorder is not None
+                else None
+            )
             outputs = envs.step(step_data)
 
             observations, rewards_l, dones, infos = [
@@ -238,6 +291,28 @@ class HabitatMASEvaluator(Evaluator):
                 rewards_l, dtype=torch.float, device="cpu"
             ).unsqueeze(1)
             current_episode_reward += rewards
+            if trajectory_recorder is not None:
+                for i in range(len(infos)):
+                    trajectory_recorder.record_step(
+                        episode_id=current_episodes_info[i].episode_id,
+                        scene_id=current_episodes_info[i].scene_id,
+                        simulator_step=simulator_steps[i],
+                        joint_env_action=step_data[i],
+                        world_state_before=world_states_before[i],
+                        policy_info=(
+                            None
+                            if action_data.policy_info is None
+                            else action_data.policy_info[i]
+                        ),
+                        reward=rewards_l[i],
+                        done=dones[i],
+                        # Keep the complete per-step info in the trajectory.
+                        # It also contains structured decision/fault metadata
+                        # (for example, a one-element action-argument list),
+                        # which must not be forced through the scalar-only
+                        # evaluator metrics helper.
+                        metrics=infos[i],
+                    )
             next_episodes_info = envs.current_episodes()
             envs_to_pause = []
             n_envs = envs.num_envs
@@ -312,6 +387,13 @@ class HabitatMASEvaluator(Evaluator):
                         "reward": current_episode_reward[i].item()
                     }
                     episode_stats.update(extract_scalars_from_info(infos[i]))
+                    if trajectory_recorder is not None:
+                        trajectory_recorder.record_episode_end(
+                            episode_id=current_episodes_info[i].episode_id,
+                            scene_id=current_episodes_info[i].scene_id,
+                            simulator_step=simulator_steps[i],
+                            result=episode_stats,
+                        )
                     current_episode_reward[i] = 0
                     k = (
                         current_episodes_info[i].scene_id,
@@ -324,6 +406,7 @@ class HabitatMASEvaluator(Evaluator):
                     # clear the prev_actions and recurrent_hidden_states
                     prev_actions[i] = 0
                     test_recurrent_hidden_states[i] = 0
+                    simulator_steps[i] = 0
 
                     if len(config.habitat_baselines.eval.video_option) > 0:
                         if config.habitat_baselines.eval.generate_fourth_rgb:
@@ -363,6 +446,8 @@ class HabitatMASEvaluator(Evaluator):
                             config.habitat.task,
                             current_episodes_info[i].episode_id,
                         )
+                else:
+                    simulator_steps[i] += 1
 
             not_done_masks = not_done_masks.to(device=device)
             (
@@ -392,6 +477,12 @@ class HabitatMASEvaluator(Evaluator):
                 agent.actor_critic.on_envs_pause(envs_to_pause)
 
         pbar.close()
+        if fault_recorder is not None and fault_recorder.count == 0:
+            raise FaultInjectionError(
+                "faulty evaluation completed without injecting the configured "
+                "object-localization fault; check episode_id, agent, "
+                "decision_step, and object_name"
+            )
         assert (
             len(ep_eval_count) >= number_of_eval_episodes
         ), f"Expected {number_of_eval_episodes} episodes, got {len(ep_eval_count)}."

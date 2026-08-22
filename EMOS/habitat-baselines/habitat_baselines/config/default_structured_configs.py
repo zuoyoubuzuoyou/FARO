@@ -438,6 +438,40 @@ class EvaluatorConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class ObjectLocalizationFaultConfig(HabitatBaselinesBaseConfig):
+    """One-shot symbolic object-localization fault for EMOS LLM agents."""
+
+    enabled: bool = False
+    fault_id: str = "PF_object_localization_001"
+    # Empty means every episode; otherwise match the dataset episode ID.
+    episode_id: str = ""
+    agent: str = "agent_0"
+    # Zero-based high-level decision index for the selected agent.
+    decision_step: int = 0
+    # Exact quoted object name used in scene_description.
+    object_name: str = ""
+    # MP3D semantic localization fields.
+    replacement_region: str = ""
+    replacement_floor: str = ""
+    # HSSD geometric localization fields. Values remain strings so an empty
+    # string can mean "do not mutate this field".
+    replacement_height: str = ""
+    replacement_horizontal_distance: str = ""
+    # Record clean or faulty execution as a JSONL event trajectory. Recording
+    # is independent of `enabled`, so a clean baseline can also be exported.
+    record_trajectory: bool = False
+    output_dir: str = "fault_output"
+    run_label: str = "faulty"
+
+
+@dataclass
+class FaultInjectionConfig(HabitatBaselinesBaseConfig):
+    object_localization: ObjectLocalizationFaultConfig = field(
+        default_factory=ObjectLocalizationFaultConfig
+    )
+
+
+@dataclass
 class HydraCallbackConfig(HabitatBaselinesBaseConfig):
     """
     Generic callback option for Hydra. Used to create the `_target_` class or
@@ -481,6 +515,9 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # Creates the vectorized environment.
     vector_env_factory: VectorEnvFactoryConfig = VectorEnvFactoryConfig()
     evaluator: EvaluatorConfig = EvaluatorConfig()
+    fault_injection: FaultInjectionConfig = field(
+        default_factory=FaultInjectionConfig
+    )
     eval_keys_to_include_in_name: List[str] = field(default_factory=list)
     # For our use case, the CPU side things are mainly memory copies
     # and nothing of substantive compute. PyTorch has been making
