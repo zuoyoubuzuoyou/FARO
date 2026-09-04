@@ -12,6 +12,10 @@ import gym.spaces as spaces
 import numpy as np
 import torch
 from habitat_mas.agents.actions.discussion_actions import *
+from habitat_mas.fault_injection.agent_dropout import (
+    AgentDropoutFaultSpec,
+    build_agent_dropout_event,
+)
 from habitat_mas.utils import AgentArguments
 from habitat_mas.utils.models import OpenAIModel
 
@@ -26,6 +30,7 @@ from habitat_baselines.rl.multi_agent.pop_play_wrappers import (
 )
 from habitat_baselines.rl.hrl.hierarchical_policy import HierarchicalPolicy
 from habitat_baselines.rl.hrl.hl.llm_policy import LLMHighLevelPolicy
+from habitat_baselines.rl.ppo.policy import PolicyActionData
 from habitat_baselines.rl.multi_agent.utils import (
     add_agent_names,
     add_agent_prefix,
@@ -454,6 +459,11 @@ class MultiLLMPolicy(MultiPolicy):
                 self.should_numerical
             )
         ]
+        # Zero-based, per-episode and per-agent high-level decision counters.
+        # The event stored in _active_dropout_events also makes a triggered
+        # dropout permanent without advancing the dropped agent's policy.
+        self._decision_steps = {}
+        self._active_dropout_events = {}
 
     def set_active(self, active_policies):
         self._active_policies = active_policies
@@ -461,6 +471,76 @@ class MultiLLMPolicy(MultiPolicy):
     def on_envs_pause(self, envs_to_pause):
         for policy in self._active_policies:
             policy.on_envs_pause(envs_to_pause)
+
+    @staticmethod
+    def _make_agent_dropout_action(
+        policy,
+        agent_rnn_hidden_states,
+        agent_prev_actions,
+        dropout_events,
+        active_dropout_events,
+        simulator_steps,
+        decision_steps,
+    ):
+        """Return a neutral action without invoking the dropped policy."""
+
+        batch_size = agent_prev_actions.shape[0]
+        device = agent_prev_actions.device
+        policy_info = []
+        for env_i in range(batch_size):
+            active_event = active_dropout_events[env_i]
+            info = {
+                "dropout_active": True,
+                "dropout_trigger_domain": active_event["trigger_domain"],
+                "dropout_since_simulator_step": int(
+                    active_event["simulator_step"]
+                ),
+                "dropout_since_decision_step": active_event[
+                    "decision_step"
+                ],
+                "simulator_step": int(simulator_steps[env_i]),
+                "decision_step": int(decision_steps[env_i]),
+            }
+            if dropout_events[env_i] is not None:
+                info["dropout_event"] = dropout_events[env_i]
+                dropout_action = {
+                    "agent": dropout_events[env_i]["agent"],
+                    "action": "agent_dropout_noop",
+                    "arguments": [],
+                    "reason": "structure_fault_injected",
+                    "trigger_domain": dropout_events[env_i][
+                        "trigger_domain"
+                    ],
+                    "decision_step": dropout_events[env_i][
+                        "decision_step"
+                    ],
+                    "simulator_step": dropout_events[env_i][
+                        "simulator_step"
+                    ],
+                }
+                if (
+                    dropout_events[env_i]["trigger_domain"]
+                    == "high_level_decision"
+                ):
+                    info["high_level_decision"] = dropout_action
+                else:
+                    info["execution_override"] = dropout_action
+            policy_info.append(info)
+
+        wait_id = policy._name_to_idx["wait"]
+        return PolicyActionData(
+            rnn_hidden_states=agent_rnn_hidden_states,
+            actions=torch.zeros_like(agent_prev_actions),
+            take_actions=torch.zeros_like(agent_prev_actions),
+            values=torch.zeros((batch_size, 1), device=device),
+            action_log_probs=torch.zeros((batch_size, 1), device=device),
+            policy_info=policy_info,
+            # False freezes both the target policy state and its prev_action.
+            should_inserts=np.zeros((batch_size, 1), dtype=bool),
+            skill_id=torch.full(
+                (batch_size,), wait_id, dtype=torch.long, device=device
+            ),
+        )
 
     def act(
         self,
@@ -501,6 +581,13 @@ class MultiLLMPolicy(MultiPolicy):
         agent_masks = masks.split([1] * n_agents, -1)
         n_envs = prev_actions.shape[0]
         assert n_envs == 1, "Currently, the stage 2 only supports single environment with multiple agents."
+        dropout_spec = AgentDropoutFaultSpec.from_config(
+            kwargs.get("agent_dropout_fault")
+        )
+        dropout_spec.validate()
+        simulator_steps = kwargs.get("simulator_steps")
+        if simulator_steps is None:
+            simulator_steps = [0 for _ in range(n_envs)]
 
         text_goal = observations["pddl_text_goal"][0].tolist()
         text_goal = "".join([chr(code) for code in text_goal]).strip()
@@ -559,6 +646,70 @@ class MultiLLMPolicy(MultiPolicy):
             ]
             agent_obs = self._update_obs_with_agent_prefix_fn(observations, agent_i)
 
+            dropout_active = []
+            dropout_events = []
+            active_dropout_events = []
+            agent_decision_steps = []
+            for env_i in range(n_envs):
+                episode_id = envs_text_context[env_i].get("episode_id", "")
+                simulator_step = int(simulator_steps[env_i])
+                state_key = (str(episode_id), agent_i_handle)
+                episode_is_starting = not bool(
+                    agent_masks[agent_i][env_i].any().item()
+                )
+                if episode_is_starting:
+                    self._decision_steps[state_key] = 0
+                    self._active_dropout_events.pop(state_key, None)
+
+                decision_step = self._decision_steps.get(state_key, 0)
+                is_decision_boundary = episode_is_starting or bool(
+                    policy._cur_call_high_level[env_i].item()
+                )
+                trigger_now = dropout_spec.is_trigger(
+                    episode_id=episode_id,
+                    agent=agent_i_handle,
+                    simulator_step=simulator_step,
+                    decision_step=decision_step,
+                    is_high_level_decision=is_decision_boundary,
+                )
+                trigger_event = None
+                if (
+                    trigger_now
+                    and state_key not in self._active_dropout_events
+                ):
+                    trigger_event = build_agent_dropout_event(
+                        dropout_spec,
+                        episode_id=episode_id,
+                        simulator_step=simulator_step,
+                        decision_step=decision_step,
+                    )
+                    self._active_dropout_events[state_key] = trigger_event
+
+                active_event = self._active_dropout_events.get(state_key)
+                dropout_active.append(active_event is not None)
+                dropout_events.append(trigger_event)
+                active_dropout_events.append(active_event)
+                agent_decision_steps.append(decision_step)
+
+            if any(dropout_active):
+                if not all(dropout_active):
+                    raise RuntimeError(
+                        "batched mixed active/inactive agent dropout is not "
+                        "supported by the EMOS single-environment policy"
+                    )
+                agent_actions.append(
+                    self._make_agent_dropout_action(
+                        policy,
+                        agent_rnn_hidden_states[agent_i],
+                        agent_prev_actions[agent_i],
+                        dropout_events,
+                        active_dropout_events,
+                        simulator_steps,
+                        agent_decision_steps,
+                    )
+                )
+                continue
+
             # TODO: Currently, the stage 2 only supports single environment with multiple agents.
             # TODO: Please update the code of agent initialization and policy action to support vectorized environment.
             # Initialize action execution agent with new context information
@@ -582,17 +733,32 @@ class MultiLLMPolicy(MultiPolicy):
                 )
 
             # Run the policy
-            agent_actions.append(
-                policy.act(
-                    agent_obs,
-                    agent_rnn_hidden_states[agent_i],
-                    agent_prev_actions[agent_i],
-                    agent_masks[agent_i],
-                    deterministic,
-                    envs_text_context=envs_text_context,
-                    agent_arguments=select_agent_arguments,  # pass the task planning result to the policy
-                )
+            agent_action = policy.act(
+                agent_obs,
+                agent_rnn_hidden_states[agent_i],
+                agent_prev_actions[agent_i],
+                agent_masks[agent_i],
+                deterministic,
+                envs_text_context=envs_text_context,
+                agent_arguments=select_agent_arguments,
             )
+            if agent_action.policy_info is not None:
+                for env_i, info in enumerate(agent_action.policy_info):
+                    decision = info.get("high_level_decision")
+                    if decision is None:
+                        continue
+                    decision["decision_step"] = agent_decision_steps[env_i]
+                    decision["simulator_step"] = int(
+                        simulator_steps[env_i]
+                    )
+                    state_key = (
+                        str(envs_text_context[env_i].get("episode_id", "")),
+                        agent_i_handle,
+                    )
+                    self._decision_steps[state_key] = (
+                        agent_decision_steps[env_i] + 1
+                    )
+            agent_actions.append(agent_action)
 
         if self.should_terminate_on_wait:
             should_terminate = True

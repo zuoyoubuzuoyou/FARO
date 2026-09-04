@@ -25,6 +25,14 @@ from habitat_baselines.utils.common import (
     is_continuous_action_space,
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info
+from habitat_mas.fault_injection.agent_dropout import (
+    AgentDropoutEventRecorder,
+    AgentDropoutFaultSpec,
+    FaultInjectionError,
+)
+from habitat_mas.fault_injection.trajectory import (
+    AgentDropoutTrajectoryRecorder,
+)
 
 class HabitatMASEvaluator(Evaluator):
     """
@@ -44,6 +52,35 @@ class HabitatMASEvaluator(Evaluator):
         env_spec,
         rank0_keys,
     ):
+        agent_dropout_fault = (
+            config.habitat_baselines.fault_injection.structure.agent_dropout
+        )
+        dropout_spec = AgentDropoutFaultSpec.from_config(agent_dropout_fault)
+        dropout_spec.validate()
+        dropout_recorder = (
+            AgentDropoutEventRecorder(
+                agent_dropout_fault.output_dir,
+                agent_dropout_fault.run_label,
+            )
+            if dropout_spec.enabled
+            else None
+        )
+        trajectory_recorder = (
+            AgentDropoutTrajectoryRecorder(
+                agent_dropout_fault.output_dir,
+                agent_dropout_fault.run_label,
+                mode="faulty" if dropout_spec.enabled else "clean",
+                agent_names=config.habitat.simulator.agents.keys(),
+            )
+            if agent_dropout_fault.record_trajectory
+            else None
+        )
+        if trajectory_recorder is not None:
+            envs.call(
+                ["set_task_dynamic_state_capture"] * envs.num_envs,
+                [{"enabled": True} for _ in range(envs.num_envs)],
+            )
+        simulator_steps = [0 for _ in range(envs.num_envs)]
         observations = envs.reset()
         observations = envs.post_step(observations)
         batch = batch_obs(observations, device=device)
@@ -163,6 +200,12 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+                    if trajectory_recorder is not None:
+                        trajectory_recorder.record_episode_start(
+                            episode_id=current_episodes_info[i].episode_id,
+                            scene_id=current_episodes_info[i].scene_id,
+                            text_context=envs_text_context[i],
+                        )
 
             space_lengths = {}
             n_agents = len(config.habitat.simulator.agents)
@@ -179,6 +222,8 @@ class HabitatMASEvaluator(Evaluator):
                     not_done_masks,
                     deterministic=False,
                     envs_text_context=envs_text_context,
+                    agent_dropout_fault=agent_dropout_fault,
+                    simulator_steps=simulator_steps,
                     **space_lengths,
                 )
                 if action_data.should_inserts is None:
@@ -190,6 +235,15 @@ class HabitatMASEvaluator(Evaluator):
                     agent.actor_critic.update_hidden_state(
                         test_recurrent_hidden_states, prev_actions, action_data
                     )
+
+            if (
+                dropout_recorder is not None
+                and action_data.policy_info is not None
+            ):
+                for policy_info in action_data.policy_info:
+                    for key, value in policy_info.items():
+                        if key.endswith("_dropout_event"):
+                            dropout_recorder.record(value)
 
             # NB: Move actions to CPU.  If CUDA tensors are
             # sent in to env.step(), that will create CUDA contexts
@@ -211,6 +265,9 @@ class HabitatMASEvaluator(Evaluator):
 
             observations, rewards_l, dones, infos = [
                 list(x) for x in zip(*outputs)
+            ]
+            dynamic_state_snapshots = [
+                info.pop("_dynamic_state_snapshot", None) for info in infos
             ]
             # Note that `policy_infos` represents the information about the
             # action BEFORE `observations` (the action used to transition to
@@ -238,6 +295,44 @@ class HabitatMASEvaluator(Evaluator):
                 rewards_l, dtype=torch.float, device="cpu"
             ).unsqueeze(1)
             current_episode_reward += rewards
+            trajectory_text_contexts = [None for _ in range(len(infos))]
+            if trajectory_recorder is not None:
+                refresh_text_context = [
+                    not dones[i]
+                    and trajectory_recorder.is_high_level_trace_event(
+                        None
+                        if action_data.policy_info is None
+                        else action_data.policy_info[i]
+                    )
+                    for i in range(len(infos))
+                ]
+                if any(refresh_text_context):
+                    latest_text_contexts = envs.call(
+                        ["get_task_text_context"] * envs.num_envs
+                    )
+                    for i, should_refresh in enumerate(refresh_text_context):
+                        if should_refresh:
+                            trajectory_text_contexts[i] = (
+                                latest_text_contexts[i]
+                            )
+            if trajectory_recorder is not None:
+                for i in range(len(infos)):
+                    trajectory_recorder.record_step(
+                        episode_id=current_episodes_info[i].episode_id,
+                        scene_id=current_episodes_info[i].scene_id,
+                        simulator_step=simulator_steps[i],
+                        joint_env_action=step_data[i],
+                        policy_info=(
+                            None
+                            if action_data.policy_info is None
+                            else action_data.policy_info[i]
+                        ),
+                        reward=rewards_l[i],
+                        done=dones[i],
+                        metrics=extract_scalars_from_info(infos[i]),
+                        text_context=trajectory_text_contexts[i],
+                        simulator_state=dynamic_state_snapshots[i],
+                    )
             next_episodes_info = envs.current_episodes()
             envs_to_pause = []
             n_envs = envs.num_envs
@@ -324,6 +419,7 @@ class HabitatMASEvaluator(Evaluator):
                     # clear the prev_actions and recurrent_hidden_states
                     prev_actions[i] = 0
                     test_recurrent_hidden_states[i] = 0
+                    simulator_steps[i] = 0
 
                     if len(config.habitat_baselines.eval.video_option) > 0:
                         if config.habitat_baselines.eval.generate_fourth_rgb:
@@ -363,6 +459,8 @@ class HabitatMASEvaluator(Evaluator):
                             config.habitat.task,
                             current_episodes_info[i].episode_id,
                         )
+                else:
+                    simulator_steps[i] += 1
 
             not_done_masks = not_done_masks.to(device=device)
             (
@@ -390,8 +488,34 @@ class HabitatMASEvaluator(Evaluator):
             # empty list of envs_to_pause will raise an error.
             if any(envs_to_pause):
                 agent.actor_critic.on_envs_pause(envs_to_pause)
+                paused = set(envs_to_pause)
+                simulator_steps = [
+                    step
+                    for env_i, step in enumerate(simulator_steps)
+                    if env_i not in paused
+                ]
 
         pbar.close()
+        if dropout_recorder is not None:
+            scheduled_episode_ids = set(
+                dropout_spec.simulator_step_schedule_map()
+            )
+            if dropout_recorder.count == 0:
+                raise FaultInjectionError(
+                    "evaluation completed without triggering the configured "
+                    "agent dropout; check episode_id, agent, and "
+                    "simulator_step"
+                )
+            missing_episode_ids = (
+                scheduled_episode_ids - dropout_recorder.episode_ids
+            )
+            if missing_episode_ids:
+                raise FaultInjectionError(
+                    "evaluation did not trigger scheduled agent dropout for "
+                    "episode(s) "
+                    f"{', '.join(sorted(missing_episode_ids))}; their "
+                    "simulator steps were not reached"
+                )
         assert (
             len(ep_eval_count) >= number_of_eval_episodes
         ), f"Expected {number_of_eval_episodes} episodes, got {len(ep_eval_count)}."

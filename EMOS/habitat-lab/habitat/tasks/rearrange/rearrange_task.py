@@ -459,6 +459,88 @@ class RearrangeTask(NavigationTask):
             robot_config = self._robot_config[current_episode_idx]["agents"]
         return get_text_context(self._sim, robot_config)
 
+    @staticmethod
+    def _snapshot_vector(value: Any) -> List[float]:
+        return [float(component) for component in value]
+
+    @staticmethod
+    def _snapshot_rotation(value: Any) -> Union[float, List[float]]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+        if hasattr(value, "vector") and hasattr(value, "scalar"):
+            return [
+                *RearrangeTask._snapshot_vector(value.vector),
+                float(value.scalar),
+            ]
+        return RearrangeTask._snapshot_vector(value)
+
+    def get_dynamic_state_snapshot(self) -> Dict[str, Any]:
+        """Capture physical agent and rigid-object state after an env step."""
+
+        sim = self._sim
+        rigid_object_manager = sim.get_rigid_object_manager()
+
+        def object_identity(object_id: int) -> Dict[str, Any]:
+            rigid_object = rigid_object_manager.get_object_by_id(object_id)
+            handle = None if rigid_object is None else rigid_object.handle
+            goal_name = (
+                None
+                if handle is None
+                else sim._handle_to_goal_name.get(handle)
+            )
+            return {
+                "object_id": int(object_id),
+                "handle": handle,
+                "goal_name": goal_name,
+            }
+
+        agents: Dict[str, Any] = {}
+        for agent_index, agent_name in enumerate(sim.agents_mgr.agents_order):
+            agent_data = sim.get_agent_data(agent_index)
+            articulated_agent = agent_data.articulated_agent
+            held_object_id = agent_data.grasp_mgr.snap_idx
+            agents[str(agent_name)] = {
+                "position": self._snapshot_vector(
+                    articulated_agent.base_pos
+                ),
+                "rotation": self._snapshot_rotation(
+                    articulated_agent.base_rot
+                ),
+                "held_object": (
+                    None
+                    if held_object_id is None
+                    else object_identity(held_object_id)
+                ),
+            }
+
+        objects = []
+        seen_object_ids = set()
+        for handle, relative_object_id in sim.handle_to_object_id.items():
+            object_id = sim.scene_obj_ids[relative_object_id]
+            if object_id in seen_object_ids:
+                continue
+            seen_object_ids.add(object_id)
+            rigid_object = rigid_object_manager.get_object_by_id(object_id)
+            if rigid_object is None:
+                continue
+            objects.append(
+                {
+                    **object_identity(object_id),
+                    "handle": str(handle),
+                    "position": self._snapshot_vector(
+                        rigid_object.transformation.translation
+                    ),
+                }
+            )
+
+        return {
+            "timing": "post_env_step",
+            "agents": agents,
+            "objects": objects,
+        }
+
     @property
     def should_end(self) -> bool:
         return self._should_end

@@ -42,7 +42,13 @@ def extract_scalars_from_info(
         # Things that are scalar-like will have an np.size of 1.
         # Strings also have an np.size of 1, so explicitly ban those
         elif np.size(v) == 1 and not isinstance(v, str):
-            result[k] = float(v)
+            # Policy diagnostics can contain one-element non-numeric
+            # containers (for example the high-level action arguments
+            # ["500"]). They are metadata, not evaluation metrics.
+            try:
+                result[k] = float(v)
+            except (TypeError, ValueError):
+                continue
 
     return result
 

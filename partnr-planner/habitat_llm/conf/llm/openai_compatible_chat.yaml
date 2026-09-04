@@ -1,0 +1,29 @@
+llm:
+  _target_    : habitat_llm.llm.openai_compatible_chat.OpenAICompatibleChat
+  _partial_   : True
+
+verbose       : True
+
+# The internal endpoint must be supplied at runtime through OPENAI_BASE_URL.
+# The API key must be supplied at runtime through OPENAI_API_KEY.
+system_message       : 'You are an expert at task planning.'
+
+# System, User, Assistant and end of turn tags
+system_tag : ""
+user_tag : ""
+assistant_tag : ""
+eot_tag : ""
+
+# PARTNR already carries prior ReAct steps in the prompt, so API-side message
+# history is disabled by default.
+keep_message_history : False
+
+# The planner's stopword is applied locally after generation.  Keeping it out
+# of the request maximizes compatibility with reasoning-model gateways.
+send_stop_to_api : False
+
+generation_params:
+  model           : gpt-5.6-terra
+  max_tokens      : 250
+  stream          : False
+  request_timeout : 120

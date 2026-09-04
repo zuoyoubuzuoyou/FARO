@@ -125,6 +125,7 @@ class LLMHighLevelPolicy(HighLevelPolicy):
         next_skill = torch.zeros(batch_size)
         skill_args_data = [None for _ in range(batch_size)]
         immediate_end = torch.zeros(batch_size, dtype=torch.bool)
+        policy_info = [{} for _ in range(batch_size)]
 
         assert self.llm_agent.initialized, "Exception in LLMHighLevelPolicy.get_next_skill(): LLM agent not initialized."
 
@@ -144,6 +145,12 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             if llm_output is None:
                 next_skill[batch_idx] = self._skill_name_to_idx["wait"]
                 skill_args_data[batch_idx] = ["500"]
+                policy_info[batch_idx]["high_level_decision"] = {
+                    "agent": self.llm_agent.name,
+                    "action": "wait",
+                    "arguments": ["500"],
+                    "reason": "llm_returned_no_action",
+                }
                 continue
 
             action_name = llm_output["name"]
@@ -152,14 +159,30 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             if action_name in self._skill_name_to_idx:
                 next_skill[batch_idx] = self._skill_name_to_idx[action_name]
                 skill_args_data[batch_idx] = action_args
+                selected_action = action_name
+                selected_args = action_args
             else:
                 # If the action is not valid, do nothing
                 next_skill[batch_idx] = self._skill_name_to_idx["wait"]
                 skill_args_data[batch_idx] = ["500"]
+                selected_action = "wait"
+                selected_args = ["500"]
+
+            policy_info[batch_idx]["high_level_decision"] = {
+                "agent": self.llm_agent.name,
+                "action": selected_action,
+                "arguments": selected_args,
+            }
+            if selected_action != action_name:
+                policy_info[batch_idx]["requested_action"] = {
+                    "action": action_name,
+                    "arguments": llm_output["arguments"],
+                    "reason": "action_not_in_skill_map",
+                }
 
         return (
             next_skill,
             skill_args_data,
             immediate_end,
-            PolicyActionData(),
+            PolicyActionData(policy_info=policy_info),
         )

@@ -1,12 +1,76 @@
 import json
 import os
+import threading
+import time
+from collections import deque
 from ..agents.crab_core import Action
-from typing import List
+from typing import Any, List
 import openai
 from .python_interpreter import SubprocessInterpreter
 # from openai.types.chat.chat_completion import ChatCompletionMessage
 # from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 from pydantic import BaseModel
+
+
+_REQUEST_TIMESTAMPS: deque[float] = deque()
+_REQUEST_RATE_LOCK = threading.Lock()
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number") from error
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def _wait_for_request_slot(max_requests_per_minute: int) -> None:
+    """Keep all EMOS model instances below the shared per-minute limit."""
+
+    if max_requests_per_minute == 0:
+        return
+    while True:
+        now = time.monotonic()
+        with _REQUEST_RATE_LOCK:
+            while (
+                _REQUEST_TIMESTAMPS
+                and now - _REQUEST_TIMESTAMPS[0]
+                >= _RATE_LIMIT_WINDOW_SECONDS
+            ):
+                _REQUEST_TIMESTAMPS.popleft()
+            if len(_REQUEST_TIMESTAMPS) < max_requests_per_minute:
+                _REQUEST_TIMESTAMPS.append(now)
+                return
+            wait_seconds = (
+                _RATE_LIMIT_WINDOW_SECONDS
+                - (now - _REQUEST_TIMESTAMPS[0])
+                + 1.0
+            )
+        print(
+            "[OpenAIModel] local request limit reached; waiting "
+            f"{wait_seconds:.1f}s",
+            flush=True,
+        )
+        time.sleep(wait_seconds)
 
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -38,7 +102,22 @@ class OpenAIModel:
         self.chat_history = []
         self.window_size = window_size
         self.model = model
-        self.client = openai.OpenAI()
+        # Disable the SDK's short built-in retries. EMOS applies a longer,
+        # observable retry policy below and counts every retry for throttling.
+        self.client = openai.OpenAI(max_retries=0)
+        self.max_retries = _env_int("EMOS_LLM_MAX_RETRIES", 10)
+        self.max_requests_per_minute = _env_int(
+            "EMOS_LLM_REQUESTS_PER_MINUTE", 50
+        )
+        self.service_backoff_seconds = _env_float(
+            "EMOS_LLM_503_BACKOFF_SECONDS", 5.0
+        )
+        self.max_service_backoff_seconds = _env_float(
+            "EMOS_LLM_503_MAX_BACKOFF_SECONDS", 60.0
+        )
+        self.rate_limit_cooldown_seconds = _env_float(
+            "EMOS_LLM_429_COOLDOWN_SECONDS", 65.0
+        )
         self.planning_stage = discussion_stage
         self.code_execution = code_execution
         if self.code_execution:
@@ -60,7 +139,7 @@ class OpenAIModel:
     
     def __del__(self):
         """Save chat history to a file if logging is enabled"""
-        if self.enable_logging:
+        if getattr(self, "enable_logging", False):
             self.save_chat_history(self.logging_file)
            
     def save_chat_history(self, file_path: str):
@@ -89,6 +168,53 @@ class OpenAIModel:
         print("Internal action: ", action_name, parameters)
         return str(self.action_map[action_name].run(**parameters))
 
+    @staticmethod
+    def _retry_after_seconds(error: openai.APIStatusError) -> float:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return 0.0
+        raw_value = headers.get("retry-after")
+        if raw_value is None:
+            return 0.0
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _chat_completion(self, **kwargs: Any):
+        """Call Chat Completions with throttling and 429/503 retries."""
+
+        for retry_index in range(self.max_retries + 1):
+            _wait_for_request_slot(self.max_requests_per_minute)
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except openai.APIStatusError as error:
+                status_code = getattr(error, "status_code", None)
+                retryable = status_code in {429, 503}
+                if not retryable or retry_index >= self.max_retries:
+                    raise
+
+                if status_code == 429:
+                    wait_seconds = max(
+                        self.rate_limit_cooldown_seconds,
+                        self._retry_after_seconds(error),
+                    )
+                else:
+                    wait_seconds = min(
+                        self.service_backoff_seconds * (2**retry_index),
+                        self.max_service_backoff_seconds,
+                    )
+                print(
+                    f"[OpenAIModel] HTTP {status_code}; retry "
+                    f"{retry_index + 1}/{self.max_retries} in "
+                    f"{wait_seconds:.1f}s",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+
+        raise RuntimeError("unreachable model retry state")
+
     def chat(self, content: str, crab_planning=False):
         new_message = {"role": "user", "content": content}
 
@@ -107,13 +233,13 @@ class OpenAIModel:
         if self.planning_stage:
             while True:
                 if self.tool_calls_enable:
-                    response = self.client.chat.completions.create(
+                    response = self._chat_completion(
                         messages=request,  # type: ignore
                         model=self.model,
                         tools=self.openai_tools,
                     )
                 else:
-                    response = self.client.chat.completions.create(
+                    response = self._chat_completion(
                         messages=request,  # type: ignore
                         model=self.model,
                     )
@@ -168,7 +294,7 @@ class OpenAIModel:
                     return response_message.content
         elif crab_planning:
             while True:
-                response = self.client.chat.completions.create(
+                response = self._chat_completion(
                     messages=request,  # type: ignore
                     model=self.model,
                 )
@@ -182,7 +308,7 @@ class OpenAIModel:
                     self.save_chat_history(self.logging_file)
                 return response_message.content
         else:
-            response = self.client.chat.completions.create(
+            response = self._chat_completion(
                 messages=request,  # type: ignore
                 model=self.model,
                 tools=[

@@ -49,6 +49,7 @@ class RLTaskEnv(habitat.RLEnv):
         self._slack_reward = self.config.task.slack_reward
         self._success_reward = self.config.task.success_reward
         self._end_on_success = self.config.task.end_on_success
+        self._capture_dynamic_state = False
         assert (
             self._reward_measure_name is not None
         ), "The key task.reward_measure cannot be None"
@@ -64,7 +65,20 @@ class RLTaskEnv(habitat.RLEnv):
     def step(
         self, *args, **kwargs
     ) -> Tuple[RLTaskEnvObsType, float, bool, dict]:
-        return super().step(*args, **kwargs)
+        observations, reward, done, info = super().step(*args, **kwargs)
+        if self._capture_dynamic_state and hasattr(
+            self._env.task, "get_dynamic_state_snapshot"
+        ):
+            info = dict(info)
+            info["_dynamic_state_snapshot"] = (
+                self._env.task.get_dynamic_state_snapshot()
+            )
+        return observations, reward, done, info
+
+    def set_task_dynamic_state_capture(self, enabled: bool) -> None:
+        """Enable post-step snapshots before VectorEnv auto-reset occurs."""
+
+        self._capture_dynamic_state = bool(enabled)
 
     def get_reward_range(self):
         # We don't know what the reward measure is bounded by
@@ -104,6 +118,15 @@ class RLTaskEnv(habitat.RLEnv):
             "Please implement this method in the task class."
         )
         return self._env.task.get_task_text_context()
+
+    def get_task_dynamic_state(self) -> dict:
+        """Return a JSON-serializable post-step task state snapshot."""
+
+        assert hasattr(self._env.task, "get_dynamic_state_snapshot"), (
+            "The task does not have a get_dynamic_state_snapshot method. "
+            "Please implement this method in the task class."
+        )
+        return self._env.task.get_dynamic_state_snapshot()
 
 
 @habitat.registry.register_env(name="GymRegistryEnv")

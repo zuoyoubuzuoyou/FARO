@@ -401,7 +401,11 @@ def overlay_frame(frame, info, additional=None):
         if isinstance(v, str):
             lines.append(f"{k}: {v}")
         elif isinstance(v, list):
-            lines.append(f"{k}: {v[0]}")
+            # High-level actions with no parameters (including an injected
+            # AgentDropoutNoOp) legitimately carry an empty argument list.
+            # Treat it as display metadata instead of indexing past it.
+            display_value = v[0] if len(v) > 0 else "[]"
+            lines.append(f"{k}: {display_value}")
         else:
             lines.append(f"{k}: {v:.2f}")
     if additional is not None:

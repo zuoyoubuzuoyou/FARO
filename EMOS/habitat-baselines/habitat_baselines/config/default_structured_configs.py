@@ -448,6 +448,48 @@ class HydraCallbackConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class AgentDropoutFaultConfig(HabitatBaselinesBaseConfig):
+    """Permanent logical dropout triggered by simulator or decision step."""
+
+    enabled: bool = False
+    fault_id: str = "SF_agent_dropout_001"
+    # Empty matches every episode; otherwise match the dataset episode ID.
+    episode_id: str = ""
+    agent: str = "agent_0"
+    # "simulator_step" interrupts the agent before a physical environment
+    # action. "high_level_decision" suppresses the target agent immediately
+    # before its zero-based Nth high-level policy/LLM decision.
+    trigger_domain: str = "simulator_step"
+    # Zero-based Habitat environment step. The target agent is suppressed
+    # before the action for this step is sent to env.step().
+    simulator_step: int = 0
+    # Optional per-episode simulator-step schedule in the form
+    # "episode_id@step;episode_id@step". When set, it replaces episode_id and
+    # simulator_step and only the listed episodes receive the fault.
+    simulator_step_schedule: str = ""
+    # Zero-based, per-agent high-level decision index. Agents decide
+    # asynchronously, so each agent owns an independent counter.
+    decision_step: int = 0
+    record_trajectory: bool = False
+    output_dir: str = "fault_output"
+    run_label: str = "agent_dropout"
+
+
+@dataclass
+class StructureFaultConfig(HabitatBaselinesBaseConfig):
+    agent_dropout: AgentDropoutFaultConfig = field(
+        default_factory=AgentDropoutFaultConfig
+    )
+
+
+@dataclass
+class FaultInjectionConfig(HabitatBaselinesBaseConfig):
+    structure: StructureFaultConfig = field(
+        default_factory=StructureFaultConfig
+    )
+
+
+@dataclass
 class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # task config can be a list of configs like "A.yaml,B.yaml"
     # If habitat_baselines.evaluate is true, the run will be in evaluation mode
@@ -478,6 +520,9 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     log_file: str = "train.log"
     force_blind_policy: bool = False
     verbose: bool = True
+    fault_injection: FaultInjectionConfig = field(
+        default_factory=FaultInjectionConfig
+    )
     # Creates the vectorized environment.
     vector_env_factory: VectorEnvFactoryConfig = VectorEnvFactoryConfig()
     evaluator: EvaluatorConfig = EvaluatorConfig()
