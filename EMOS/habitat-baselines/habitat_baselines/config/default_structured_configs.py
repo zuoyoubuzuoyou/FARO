@@ -476,10 +476,29 @@ class AgentDropoutFaultConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class AgentHangFaultConfig(HabitatBaselinesBaseConfig):
+    """Hang at a simulator step and stay unresponsive until episode end."""
+
+    enabled: bool = False
+    fault_id: str = "SF_agent_hang_001"
+    # Empty matches every evaluated episode.
+    episode_id: str = ""
+    agent: str = "agent_0"
+    # Zero-based step, suppressed before env.step().
+    simulator_step: int = 0
+    # Optional "episode_id@step;..." schedule, exclusive with episode_id.
+    simulator_step_schedule: str = ""
+    record_trajectory: bool = False
+    output_dir: str = "fault_output"
+    run_label: str = "agent_hang"
+
+
+@dataclass
 class StructureFaultConfig(HabitatBaselinesBaseConfig):
     agent_dropout: AgentDropoutFaultConfig = field(
         default_factory=AgentDropoutFaultConfig
     )
+    agent_hang: AgentHangFaultConfig = field(default_factory=AgentHangFaultConfig)
 
 
 @dataclass

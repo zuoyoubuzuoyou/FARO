@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from habitat_mas.fault_injection.naming import output_run_stem
+
 
 def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -57,17 +59,20 @@ class AgentDropoutTrajectoryRecorder:
         run_label: str,
         mode: str,
         agent_names: Optional[Iterable[str]] = None,
+        *,
+        fault_name: str = "agent_dropout",
     ) -> None:
-        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_label))
         self.run_label = str(run_label)
         self.mode = str(mode)
+        output_type = "clean" if self.mode == "clean" else fault_name
+        run_stem = output_run_stem(run_label, output_type)
         self.path = (
             Path(output_dir)
-            / f"{safe_label}_agent_dropout_trajectory.jsonl"
+            / f"{run_stem}_trajectory.jsonl"
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")
-        self._safe_label = safe_label
+        self._run_stem = run_stem
         self._text_paths: Dict[str, Path] = {}
         self._agent_names = [str(name) for name in (agent_names or [])]
         self._active_actions: Dict[str, Dict[str, Mapping[str, Any]]] = {}
@@ -85,7 +90,7 @@ class AgentDropoutTrajectoryRecorder:
         if episode_key not in self._text_paths:
             safe_episode = self._safe_component(episode_key)
             self._text_paths[episode_key] = self.path.parent / (
-                f"trace-episode_{safe_episode}-{self._safe_label}.txt"
+                f"{self._run_stem}_trace-episode_{safe_episode}.txt"
             )
         return self._text_paths[episode_key]
 
@@ -108,6 +113,7 @@ class AgentDropoutTrajectoryRecorder:
             "send_request": "SendRequest",
             "wait": "Wait",
             "agent_dropout_noop": "AgentDropoutNoOp",
+            "agent_hang_noop": "AgentHangNoOp",
             "not_recorded": "NotRecorded",
         }
         raw_name = str(decision.get("action", "unknown"))
@@ -142,6 +148,7 @@ class AgentDropoutTrajectoryRecorder:
                     "_execution_override",
                     "_pddl_action",
                     "_dropout_event",
+                    "_hang_event",
                 )
             )
             for key in policy_info
@@ -227,6 +234,17 @@ class AgentDropoutTrajectoryRecorder:
 
             decision = policy_info.get(decision_key)
             override = policy_info.get(override_key)
+            # Hang is an execution override; no new policy decision is made.
+            if bool(policy_info.get(f"{agent_name}_hang_active", False)):
+                step_actions[agent_name] = {
+                    "action": {
+                        "agent": agent_name,
+                        "action": "agent_hang_noop",
+                        "arguments": [],
+                    },
+                    "status": "hang_noop",
+                }
+                continue
             if isinstance(override, Mapping):
                 active_actions[agent_name] = dict(override)
                 status = "fault_execution_override"
@@ -314,6 +332,20 @@ class AgentDropoutTrajectoryRecorder:
                 "dropout_state": self._dropout_state(
                     agent_name, policy_info
                 ),
+                "hang_state": {
+                    "active": bool(
+                        policy_info.get(f"{agent_name}_hang_active", False)
+                    ),
+                    "since_simulator_step": policy_info.get(
+                        f"{agent_name}_hang_since_simulator_step"
+                    ),
+                    "since_decision_step": policy_info.get(
+                        f"{agent_name}_hang_since_decision_step"
+                    ),
+                    "trigger_domain": policy_info.get(
+                        f"{agent_name}_hang_trigger_domain"
+                    ),
+                },
             }
         return {
             "timing": raw_state.get("timing", "post_env_step"),
@@ -399,6 +431,15 @@ class AgentDropoutTrajectoryRecorder:
                 )
             else:
                 lines.append(f"Agent_{agent_id}_Dropout_State: inactive")
+            hang_state = agent_state.get("hang_state", {})
+            if hang_state.get("active"):
+                lines.append(
+                    f"Agent_{agent_id}_Hang_State: active "
+                    f"(since_simulator_step={hang_state.get('since_simulator_step')}, "
+                    f"since_decision_step={hang_state.get('since_decision_step')})"
+                )
+            else:
+                lines.append(f"Agent_{agent_id}_Hang_State: inactive")
 
         objects = dynamic_state.get("objects", [])
         if objects:
@@ -419,6 +460,13 @@ class AgentDropoutTrajectoryRecorder:
                 )
 
         for key, value in info.items():
+            if key.endswith("_hang_event") and isinstance(value, Mapping):
+                lines.append(
+                    f"Fault: StructureFault/AgentHang {value.get('type')} "
+                    f"at simulator step {value.get('simulator_step')} "
+                    f"for {value.get('agent')} "
+                    f"(decision_step={value.get('decision_step')}; until episode end)."
+                )
             match = re.match(r"agent_(\d+)_high_level_decision$", key)
             if match and isinstance(value, Mapping):
                 agent_id = match.group(1)
@@ -427,7 +475,9 @@ class AgentDropoutTrajectoryRecorder:
                         f"Agent_{agent_id}_Decision_Step: "
                         f"{value['decision_step']}"
                     )
-                if value.get("action") == "agent_dropout_noop":
+                if value.get("action") in {
+                    "agent_dropout_noop", "agent_hang_noop"
+                }:
                     lines.append(
                         f"Agent_{agent_id}_Observation: Policy and LLM were "
                         "not called; a zero no-op action was sent."

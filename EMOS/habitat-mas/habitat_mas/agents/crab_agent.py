@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional
 
 from .crab_core import Action
@@ -5,6 +6,32 @@ from ..utils.models import OpenAIModel
 
 
 REQUEST_TEMPLATE = '"{source_agent}" agent sent you requests: "{request}".'
+
+PDDL_TARGET_PATTERN = re.compile(r"^(?:TARGET_)?any_targets\|\d+$")
+PDDL_TARGET_ARGUMENTS = {
+    "nav_to_obj": ("target_obj",),
+    "nav_to_goal": ("target_obj",),
+    "pick": ("target_obj",),
+    "place": ("target_obj", "target_location"),
+}
+MAX_INVALID_TARGET_RETRIES = 2
+
+
+def _invalid_pddl_target_arguments(
+    action_name: str, parameters: dict
+) -> dict[str, object]:
+    """Return target arguments that are not valid PDDL entity names."""
+
+    invalid = {}
+    for argument_name in PDDL_TARGET_ARGUMENTS.get(action_name, ()):
+        value = parameters.get(argument_name)
+        if (
+            not isinstance(value, str)
+            or PDDL_TARGET_PATTERN.fullmatch(value) is None
+        ):
+            invalid[argument_name] = value
+    return invalid
+
 
 ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE = (
     'You are a "{robot_type}" agent called "{robot_key}".'
@@ -21,6 +48,11 @@ ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE = (
 
 class CrabAgent:
     message_pipe: dict[str, list[str]] = {}
+
+    @classmethod
+    def reset_message_pipe(cls) -> None:
+        """Discard unread inter-agent messages at an episode boundary."""
+        cls.message_pipe.clear()
 
     def __init__(
         self,
@@ -112,7 +144,38 @@ class CrabAgent:
             observation = str(observation) + " " + prompt
             CrabAgent.message_pipe[self.name] = []
 
-        action_name, parameters = self.llm_model.chat(str(observation))
+        action_name = "wait"
+        parameters = {}
+        for attempt in range(MAX_INVALID_TARGET_RETRIES + 1):
+            action_name, parameters = self.llm_model.chat(str(observation))
+            invalid_targets = _invalid_pddl_target_arguments(
+                action_name, parameters
+            )
+            if not invalid_targets:
+                break
+
+            if attempt == MAX_INVALID_TARGET_RETRIES:
+                print(
+                    f"Agent {self.name} repeatedly returned invalid PDDL "
+                    "targets; using wait instead of forwarding an invalid "
+                    "action to Habitat."
+                )
+                return {"name": "wait", "arguments": ["500"]}
+
+            observation = (
+                f"Your previous {action_name!r} call used invalid PDDL target "
+                f"arguments: {invalid_targets!r}. Scene asset names (for example "
+                "'048_hammer_:0000') are descriptions only and cannot be passed "
+                "to actions. Retry with one action whose target arguments use "
+                "the exact PDDL entity names from the goal conditions, such as "
+                "'any_targets|0' or 'TARGET_any_targets|0'."
+            )
+            print(
+                f"Invalid PDDL target from {self.name}; retrying action "
+                f"generation ({attempt + 1}/{MAX_INVALID_TARGET_RETRIES}): "
+                f"{invalid_targets}"
+            )
+
         if action_name == "send_request":
             target_agent = parameters["target_agent"]
             if target_agent == self.name:  # send request to itself

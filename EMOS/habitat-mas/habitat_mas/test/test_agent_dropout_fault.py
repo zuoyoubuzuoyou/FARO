@@ -225,7 +225,7 @@ class AgentDropoutFaultTest(unittest.TestCase):
             self.assertEqual(recorder.episode_ids, set())
             self.assertEqual(
                 recorder.path.name,
-                "fault_run_agent_dropout_events.jsonl",
+                "dropout_fault_run_events.jsonl",
             )
             lines = Path(recorder.path).read_text(
                 encoding="utf-8"

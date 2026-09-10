@@ -14,7 +14,12 @@ import torch
 from habitat_mas.agents.actions.discussion_actions import *
 from habitat_mas.fault_injection.agent_dropout import (
     AgentDropoutFaultSpec,
+    FaultInjectionError,
     build_agent_dropout_event,
+)
+from habitat_mas.fault_injection.agent_hang import (
+    AgentHangFaultSpec,
+    AgentHangState,
 )
 from habitat_mas.utils import AgentArguments
 from habitat_mas.utils.models import OpenAIModel
@@ -60,6 +65,10 @@ def create_leader_prompt(robot_resume):
         "Even if you think a robot should not assign a subtask, you should assign it with {robot_id||Nothing to do}.\n"
         "Even if you think a robot should assign multiple subtasks, you should combine them into one {robot_id||subtask_description} format.\n"
         "Remember the subtask target should always include 'objects', DO NOT include 'region' in |subtask description|. \n"
+        "For every actionable object target, use the exact PDDL entity name from the goal conditions, "
+        "such as 'any_targets|0' or 'TARGET_any_targets|0'. Scene asset names such as "
+        "'048_hammer_:0000' may only be used for capability reasoning and MUST NOT be used as "
+        "navigation, pick, or place targets.\n"
     )
     
     return LEADER_SYSTEM_PROMPT_TEMPLATE.format(
@@ -464,6 +473,7 @@ class MultiLLMPolicy(MultiPolicy):
         # dropout permanent without advancing the dropped agent's policy.
         self._decision_steps = {}
         self._active_dropout_events = {}
+        self._hang_states = {}
 
     def set_active(self, active_policies):
         self._active_policies = active_policies
@@ -473,58 +483,59 @@ class MultiLLMPolicy(MultiPolicy):
             policy.on_envs_pause(envs_to_pause)
 
     @staticmethod
-    def _make_agent_dropout_action(
+    def _make_agent_fault_action(
         policy,
         agent_rnn_hidden_states,
         agent_prev_actions,
-        dropout_events,
-        active_dropout_events,
+        events,
+        active_events,
         simulator_steps,
         decision_steps,
+        fault_name="dropout",
     ):
-        """Return a neutral action without invoking the dropped policy."""
+        """Return a neutral action without invoking a suspended policy."""
 
         batch_size = agent_prev_actions.shape[0]
         device = agent_prev_actions.device
         policy_info = []
         for env_i in range(batch_size):
-            active_event = active_dropout_events[env_i]
+            active_event = active_events[env_i]
             info = {
-                "dropout_active": True,
-                "dropout_trigger_domain": active_event["trigger_domain"],
-                "dropout_since_simulator_step": int(
+                f"{fault_name}_active": True,
+                f"{fault_name}_trigger_domain": active_event["trigger_domain"],
+                f"{fault_name}_since_simulator_step": int(
                     active_event["simulator_step"]
                 ),
-                "dropout_since_decision_step": active_event[
+                f"{fault_name}_since_decision_step": active_event[
                     "decision_step"
                 ],
                 "simulator_step": int(simulator_steps[env_i]),
                 "decision_step": int(decision_steps[env_i]),
             }
-            if dropout_events[env_i] is not None:
-                info["dropout_event"] = dropout_events[env_i]
-                dropout_action = {
-                    "agent": dropout_events[env_i]["agent"],
-                    "action": "agent_dropout_noop",
+            if events[env_i] is not None:
+                info[f"{fault_name}_event"] = events[env_i]
+                fault_action = {
+                    "agent": events[env_i]["agent"],
+                    "action": f"agent_{fault_name}_noop",
                     "arguments": [],
                     "reason": "structure_fault_injected",
-                    "trigger_domain": dropout_events[env_i][
+                    "trigger_domain": events[env_i][
                         "trigger_domain"
                     ],
-                    "decision_step": dropout_events[env_i][
+                    "decision_step": events[env_i][
                         "decision_step"
                     ],
-                    "simulator_step": dropout_events[env_i][
+                    "simulator_step": events[env_i][
                         "simulator_step"
                     ],
                 }
                 if (
-                    dropout_events[env_i]["trigger_domain"]
+                    events[env_i]["trigger_domain"]
                     == "high_level_decision"
                 ):
-                    info["high_level_decision"] = dropout_action
+                    info["high_level_decision"] = fault_action
                 else:
-                    info["execution_override"] = dropout_action
+                    info["execution_override"] = fault_action
             policy_info.append(info)
 
         wait_id = policy._name_to_idx["wait"]
@@ -585,6 +596,20 @@ class MultiLLMPolicy(MultiPolicy):
             kwargs.get("agent_dropout_fault")
         )
         dropout_spec.validate()
+        hang_spec = AgentHangFaultSpec.from_config(
+            kwargs.get("agent_hang_fault")
+        )
+        hang_spec.validate()
+        if dropout_spec.enabled and hang_spec.enabled:
+            raise FaultInjectionError(
+                "agent_dropout and agent_hang cannot both be enabled"
+            )
+        if hang_spec.enabled and hang_spec.agent not in {
+            f"agent_{i}" for i in range(n_agents)
+        }:
+            raise FaultInjectionError(
+                f"unknown agent_hang.agent: {hang_spec.agent}"
+            )
         simulator_steps = kwargs.get("simulator_steps")
         if simulator_steps is None:
             simulator_steps = [0 for _ in range(n_envs)]
@@ -592,15 +617,25 @@ class MultiLLMPolicy(MultiPolicy):
         text_goal = observations["pddl_text_goal"][0].tolist()
         text_goal = "".join([chr(code) for code in text_goal]).strip()
         # text_goal = "Fill in a tank with water. The tank is 80cm high, 50cm wide, and 50cm deep. The tank is empty. agent_0 has a 1L backet and agent_1 has a 2L bucket. Use function call to compute how many time agent_1 and agent_2 needs to fill the tank to full."
-        # Stage 1: If all prev_actions are zero, which means it is the first step of the episode, then we need to do group discussion
+        # Stage 1: Episode masks identify a fresh episode even when faults
+        # keep all previous actions zero during an existing episode.
         # Given: Robot resume + Scene description + task instruction
         # Output: (Subtask decomposition) + task assignment
         envs_agent_arguments = []
         for i in range(n_envs):
-            env_prev_actions = prev_actions[i]
             env_text_context = envs_text_context[i]
-            # if no previous actions, then it is the first step of the episode
-            if not env_prev_actions.any():
+            if not bool(masks[i].any().item()):
+                # CrabAgent's message pipe is shared for communication within an
+                # episode. Drop unread messages before reusing agent names in a
+                # new episode so they cannot leak into the new observations.
+                for active_policy in self._active_policies:
+                    llm_agent = active_policy._high_level_policy.llm_agent
+                    reset_message_pipe = getattr(
+                        llm_agent, "reset_message_pipe", None
+                    )
+                    if reset_message_pipe is not None:
+                        reset_message_pipe()
+                        break
                 if "robot_resume" in env_text_context:
                     robot_resume = env_text_context["robot_resume"]
                 if "scene_description" in env_text_context:
@@ -628,6 +663,9 @@ class MultiLLMPolicy(MultiPolicy):
                     episode_id=episode_id,
                 )
                 envs_agent_arguments.append(agent_arguments)
+                self._decision_steps.clear()
+                self._active_dropout_events.clear()
+                self._hang_states.clear()
                 
                 # Invalidate all action policies and flag them to be reinitialized
                 for agent_i, policy in enumerate(self._active_policies):
@@ -650,6 +688,8 @@ class MultiLLMPolicy(MultiPolicy):
             dropout_events = []
             active_dropout_events = []
             agent_decision_steps = []
+            hang_events = []
+            active_hang_events = []
             for env_i in range(n_envs):
                 episode_id = envs_text_context[env_i].get("episode_id", "")
                 simulator_step = int(simulator_steps[env_i])
@@ -690,6 +730,19 @@ class MultiLLMPolicy(MultiPolicy):
                 dropout_events.append(trigger_event)
                 active_dropout_events.append(active_event)
                 agent_decision_steps.append(decision_step)
+                hang_state = self._hang_states.setdefault(
+                    state_key, AgentHangState()
+                )
+                hang_events.append(
+                    hang_state.advance(
+                        hang_spec,
+                        episode_id=episode_id,
+                        agent=agent_i_handle,
+                        simulator_step=simulator_step,
+                        decision_step=decision_step,
+                    )
+                )
+                active_hang_events.append(hang_state.active_event)
 
             if any(dropout_active):
                 if not all(dropout_active):
@@ -698,7 +751,7 @@ class MultiLLMPolicy(MultiPolicy):
                         "supported by the EMOS single-environment policy"
                     )
                 agent_actions.append(
-                    self._make_agent_dropout_action(
+                    self._make_agent_fault_action(
                         policy,
                         agent_rnn_hidden_states[agent_i],
                         agent_prev_actions[agent_i],
@@ -706,6 +759,21 @@ class MultiLLMPolicy(MultiPolicy):
                         active_dropout_events,
                         simulator_steps,
                         agent_decision_steps,
+                    )
+                )
+                continue
+
+            if any(event is not None for event in active_hang_events):
+                agent_actions.append(
+                    self._make_agent_fault_action(
+                        policy,
+                        agent_rnn_hidden_states[agent_i],
+                        agent_prev_actions[agent_i],
+                        hang_events,
+                        active_hang_events,
+                        simulator_steps,
+                        agent_decision_steps,
+                        fault_name="hang",
                     )
                 )
                 continue
@@ -760,7 +828,12 @@ class MultiLLMPolicy(MultiPolicy):
                     )
             agent_actions.append(agent_action)
 
-        if self.should_terminate_on_wait:
+        any_agent_hung = any(
+            info.get("hang_active", False)
+            for action in agent_actions
+            for info in (action.policy_info or [])
+        )
+        if self.should_terminate_on_wait and not any_agent_hung:
             should_terminate = True
             for agent_id, agent_action in enumerate(agent_actions):
                 wait_id = self._active_policies[agent_id]._name_to_idx['wait']

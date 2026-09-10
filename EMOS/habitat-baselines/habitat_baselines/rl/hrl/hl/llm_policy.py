@@ -69,6 +69,10 @@ class LLMHighLevelPolicy(HighLevelPolicy):
         """
         self._active_envs = mask
 
+    def filter_envs(self, curr_envs_to_keep_active):
+        """Keep per-environment state aligned with active environments."""
+        self._active_envs = self._active_envs[curr_envs_to_keep_active]
+
     def get_next_skill(
         self,
         observations,

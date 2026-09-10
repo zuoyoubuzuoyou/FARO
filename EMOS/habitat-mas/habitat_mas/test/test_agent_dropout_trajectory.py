@@ -13,6 +13,38 @@ from habitat_baselines.utils.info_dict import extract_scalars_from_info
 
 
 class AgentDropoutTrajectoryTest(unittest.TestCase):
+    def test_output_name_uses_actual_run_type_as_prefix(self):
+        with TemporaryDirectory() as temp_dir:
+            clean = AgentDropoutTrajectoryRecorder(
+                temp_dir, "clean_random20_seed42", "clean"
+            )
+            dropout = AgentDropoutTrajectoryRecorder(
+                temp_dir, "experiment1", "faulty"
+            )
+            future_fault = AgentDropoutTrajectoryRecorder(
+                temp_dir,
+                "experiment2",
+                "faulty",
+                fault_name="agent_sensor_noise",
+            )
+
+            self.assertEqual(
+                clean.path.name,
+                "clean_random20_seed42_trajectory.jsonl",
+            )
+            self.assertEqual(
+                clean.text_path_for_episode(122).name,
+                "clean_random20_seed42_trace-episode_122.txt",
+            )
+            self.assertEqual(
+                dropout.path.name,
+                "dropout_experiment1_trajectory.jsonl",
+            )
+            self.assertEqual(
+                future_fault.path.name,
+                "sensor_noise_experiment2_trajectory.jsonl",
+            )
+
     def test_video_overlay_accepts_empty_fault_action_arguments(self):
         frame = np.zeros((32, 64, 3), dtype=np.uint8)
 

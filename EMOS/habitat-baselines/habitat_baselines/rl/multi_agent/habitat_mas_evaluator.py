@@ -30,6 +30,10 @@ from habitat_mas.fault_injection.agent_dropout import (
     AgentDropoutFaultSpec,
     FaultInjectionError,
 )
+from habitat_mas.fault_injection.agent_hang import (
+    AgentHangEventRecorder,
+    AgentHangFaultSpec,
+)
 from habitat_mas.fault_injection.trajectory import (
     AgentDropoutTrajectoryRecorder,
 )
@@ -55,24 +59,47 @@ class HabitatMASEvaluator(Evaluator):
         agent_dropout_fault = (
             config.habitat_baselines.fault_injection.structure.agent_dropout
         )
+        agent_hang_fault = (
+            config.habitat_baselines.fault_injection.structure.agent_hang
+        )
         dropout_spec = AgentDropoutFaultSpec.from_config(agent_dropout_fault)
+        hang_spec = AgentHangFaultSpec.from_config(agent_hang_fault)
         dropout_spec.validate()
-        dropout_recorder = (
-            AgentDropoutEventRecorder(
-                agent_dropout_fault.output_dir,
-                agent_dropout_fault.run_label,
+        hang_spec.validate()
+        if dropout_spec.enabled and hang_spec.enabled:
+            raise FaultInjectionError(
+                "agent_dropout and agent_hang cannot both be enabled"
             )
-            if dropout_spec.enabled
+        use_hang = hang_spec.enabled or (
+            agent_hang_fault.record_trajectory and not dropout_spec.enabled
+        )
+        fault_spec = hang_spec if use_hang else dropout_spec
+        fault_config = agent_hang_fault if use_hang else agent_dropout_fault
+        fault_name = "agent_hang" if use_hang else "agent_dropout"
+        if (
+            fault_spec.enabled
+            and fault_spec.agent not in config.habitat.simulator.agents
+        ):
+            raise FaultInjectionError(
+                f"unknown {fault_name}.agent: {fault_spec.agent}"
+            )
+        recorder_type = (
+            AgentHangEventRecorder if use_hang else AgentDropoutEventRecorder
+        )
+        fault_recorder = (
+            recorder_type(fault_config.output_dir, fault_config.run_label)
+            if fault_spec.enabled
             else None
         )
         trajectory_recorder = (
             AgentDropoutTrajectoryRecorder(
-                agent_dropout_fault.output_dir,
-                agent_dropout_fault.run_label,
-                mode="faulty" if dropout_spec.enabled else "clean",
+                fault_config.output_dir,
+                fault_config.run_label,
+                mode="faulty" if fault_spec.enabled else "clean",
                 agent_names=config.habitat.simulator.agents.keys(),
+                fault_name=fault_name,
             )
-            if agent_dropout_fault.record_trajectory
+            if fault_config.record_trajectory
             else None
         )
         if trajectory_recorder is not None:
@@ -181,9 +208,12 @@ class HabitatMASEvaluator(Evaluator):
         ):
             current_episodes_info = envs.current_episodes()
 
-            # If all prev_actions are zero, meaning this is the start of an episode
-            # Then collect the context of the episode
-            if current_episodes_info[0].episode_id != cur_ep_id:
+            # Refresh context for every episode, including repeat evaluations
+            # of the same dataset episode ID.
+            if (
+                current_episodes_info[0].episode_id != cur_ep_id
+                or not not_done_masks.any().item()
+            ):
                 cur_ep_id = current_episodes_info[0].episode_id
                 print("===============================================================================")
                 print("=================================Episode ID====================================")
@@ -223,6 +253,7 @@ class HabitatMASEvaluator(Evaluator):
                     deterministic=False,
                     envs_text_context=envs_text_context,
                     agent_dropout_fault=agent_dropout_fault,
+                    agent_hang_fault=agent_hang_fault,
                     simulator_steps=simulator_steps,
                     **space_lengths,
                 )
@@ -237,13 +268,13 @@ class HabitatMASEvaluator(Evaluator):
                     )
 
             if (
-                dropout_recorder is not None
+                fault_recorder is not None
                 and action_data.policy_info is not None
             ):
                 for policy_info in action_data.policy_info:
                     for key, value in policy_info.items():
-                        if key.endswith("_dropout_event"):
-                            dropout_recorder.record(value)
+                        if key.endswith(("_dropout_event", "_hang_event")):
+                            fault_recorder.record(value)
 
             # NB: Move actions to CPU.  If CUDA tensors are
             # sent in to env.step(), that will create CUDA contexts
@@ -486,7 +517,7 @@ class HabitatMASEvaluator(Evaluator):
             # We only do this if there are envs to pause to reduce the overhead.
             # In addition, HRL policy requires the solution_actions to be non-empty, and
             # empty list of envs_to_pause will raise an error.
-            if any(envs_to_pause):
+            if envs_to_pause:
                 agent.actor_critic.on_envs_pause(envs_to_pause)
                 paused = set(envs_to_pause)
                 simulator_steps = [
@@ -496,22 +527,26 @@ class HabitatMASEvaluator(Evaluator):
                 ]
 
         pbar.close()
-        if dropout_recorder is not None:
+        if fault_recorder is not None:
             scheduled_episode_ids = set(
-                dropout_spec.simulator_step_schedule_map()
+                fault_spec.simulator_step_schedule_map()
             )
-            if dropout_recorder.count == 0:
+            if fault_recorder.count == 0:
+                trigger_setting = (
+                    "simulator_step" if use_hang
+                    else "simulator_step / decision_step"
+                )
                 raise FaultInjectionError(
                     "evaluation completed without triggering the configured "
-                    "agent dropout; check episode_id, agent, and "
-                    "simulator_step"
+                    f"{fault_name}; check episode_id, agent, and "
+                    f"{trigger_setting}"
                 )
             missing_episode_ids = (
-                scheduled_episode_ids - dropout_recorder.episode_ids
+                scheduled_episode_ids - fault_recorder.episode_ids
             )
             if missing_episode_ids:
                 raise FaultInjectionError(
-                    "evaluation did not trigger scheduled agent dropout for "
+                    f"evaluation did not trigger scheduled {fault_name} for "
                     "episode(s) "
                     f"{', '.join(sorted(missing_episode_ids))}; their "
                     "simulator steps were not reached"

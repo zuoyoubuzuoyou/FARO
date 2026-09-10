@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from habitat_mas.fault_injection.naming import output_run_stem
+
 
 class FaultInjectionError(ValueError):
     """Raised when an enabled structure fault is invalid or never fires."""
@@ -250,11 +252,17 @@ def build_agent_dropout_event(
 class AgentDropoutEventRecorder:
     """Write agent-dropout audit events as JSON Lines."""
 
-    def __init__(self, output_dir: str, run_label: str) -> None:
-        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_label))
+    def __init__(
+        self,
+        output_dir: str,
+        run_label: str,
+        *,
+        fault_name: str = "agent_dropout",
+    ) -> None:
+        run_stem = output_run_stem(run_label, fault_name)
         self.path = (
             Path(output_dir)
-            / f"{safe_label}_agent_dropout_events.jsonl"
+            / f"{run_stem}_events.jsonl"
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")

@@ -183,7 +183,7 @@ class OpenAIModel:
             return 0.0
 
     def _chat_completion(self, **kwargs: Any):
-        """Call Chat Completions with throttling and 429/503 retries."""
+        """Call Chat Completions with throttling and transient-error retries."""
 
         for retry_index in range(self.max_retries + 1):
             _wait_for_request_slot(self.max_requests_per_minute)
@@ -191,7 +191,7 @@ class OpenAIModel:
                 return self.client.chat.completions.create(**kwargs)
             except openai.APIStatusError as error:
                 status_code = getattr(error, "status_code", None)
-                retryable = status_code in {429, 503}
+                retryable = status_code in {429, 503, 524}
                 if not retryable or retry_index >= self.max_retries:
                     raise
 
@@ -231,6 +231,8 @@ class OpenAIModel:
         self.chat_history.append([new_message])
 
         if self.planning_stage:
+            incomplete_code_retries = 0
+            max_incomplete_code_retries = 2
             while True:
                 if self.tool_calls_enable:
                     response = self._chat_completion(
@@ -250,7 +252,28 @@ class OpenAIModel:
                 request.append(response_message)
 
                 tool_calls = response_message.tool_calls
-                codes = _extract_code(response_message.content)
+                try:
+                    codes = _extract_code(response_message.content)
+                except IncompleteCodeBlockError:
+                    if incomplete_code_retries >= max_incomplete_code_retries:
+                        if self.save_on_each_chat:
+                            self.save_chat_history(self.logging_file)
+                        return response_message.content
+
+                    incomplete_code_retries += 1
+                    retry_message = {
+                        "role": "user",
+                        "content": (
+                            "Your previous response contains an unclosed Markdown "
+                            "code block. Please resend the complete response and "
+                            "make sure every opening ``` fence has a closing ``` "
+                            "fence."
+                        ),
+                    }
+                    self.chat_history[-1].append(retry_message)
+                    request.append(retry_message)
+                    continue
+
                 if self.tool_calls_enable and tool_calls is not None:
                     for tool_call in tool_calls:
                         tool_call_result = {
@@ -361,6 +384,10 @@ class OpenAIModel:
             self.actions.append(new_action)
 
 
+class IncompleteCodeBlockError(ValueError):
+    """Raised when a Markdown code block has no closing fence."""
+
+
 def _extract_code(content) -> list[tuple[str, str]]:
     codes = []
     texts = []
@@ -380,8 +407,14 @@ def _extract_code(content) -> list[tuple[str, str]]:
         code_type = lines[idx].strip()[3:].strip()
         idx += 1
         start_idx = idx
-        while not lines[idx].lstrip().startswith("```"):
+        while idx < len(lines) and not lines[idx].lstrip().startswith("```"):
             idx += 1
+
+        if idx >= len(lines):
+            raise IncompleteCodeBlockError(
+                "The model response contains an unclosed Markdown code block."
+            )
+
         code = "\n".join(lines[start_idx:idx]).strip()
         codes.append((code, code_type))
 

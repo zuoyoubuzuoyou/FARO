@@ -55,6 +55,26 @@ class OpenAIModelRetryTest(unittest.TestCase):
 
     @patch("habitat_mas.utils.models._wait_for_request_slot")
     @patch("habitat_mas.utils.models.time.sleep")
+    def test_retries_524_with_exponential_backoff(
+        self, sleep: MagicMock, wait_for_slot: MagicMock
+    ) -> None:
+        model = self._model()
+        success = object()
+        model.client.chat.completions.create.side_effect = [
+            openai.InternalServerError(
+                "origin timeout", response=self._response(524), body={}
+            ),
+            success,
+        ]
+
+        result = model._chat_completion(model="gpt-5.5", messages=[])
+
+        self.assertIs(result, success)
+        sleep.assert_called_once_with(5.0)
+        self.assertEqual(wait_for_slot.call_count, 2)
+
+    @patch("habitat_mas.utils.models._wait_for_request_slot")
+    @patch("habitat_mas.utils.models.time.sleep")
     def test_429_waits_for_retry_after_or_full_window(
         self, sleep: MagicMock, _wait_for_slot: MagicMock
     ) -> None:

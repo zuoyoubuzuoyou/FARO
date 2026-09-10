@@ -1,5 +1,7 @@
 # Agent Dropout Structure Fault MVP
 
+推荐使用[统一错误注入命令行](FAULT_INJECTION_CLI.md)，通过 `--fault`、`--episode` / `--random-episodes` 和 `--step` / `--trajectory` 指定注入。
+
 This MVP injects a permanent, silent, logical agent dropout using either a
 zero-based Habitat `simulator_step` or a zero-based, per-agent
 `high_level_decision` step.
@@ -29,7 +31,7 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   habitat_baselines.fault_injection.structure.agent_dropout.enabled=False \
   habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
   habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=dropout_clean
+  habitat_baselines.fault_injection.structure.agent_dropout.run_label=clean
 ```
 
 ## Faulty run: simulator-step trigger
@@ -136,17 +138,17 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
 The outputs are:
 
 ```text
-fault_output/dropout_clean_agent_dropout_trajectory.jsonl
-fault_output/dropout_sim_step_agent_dropout_trajectory.jsonl
-fault_output/dropout_sim_step_agent_dropout_events.jsonl
-fault_output/dropout_decision_step_agent_dropout_trajectory.jsonl
-fault_output/dropout_decision_step_agent_dropout_events.jsonl
-fault_output/trace-episode_15-dropout_clean.txt
-fault_output/trace-episode_15-dropout_sim_step.txt
-fault_output/trace-episode_15-dropout_decision_step.txt
+fault_output/clean_trajectory.jsonl
+fault_output/dropout_sim_step_trajectory.jsonl
+fault_output/dropout_sim_step_events.jsonl
+fault_output/dropout_decision_step_trajectory.jsonl
+fault_output/dropout_decision_step_events.jsonl
+fault_output/clean_trace-episode_15.txt
+fault_output/dropout_sim_step_trace-episode_15.txt
+fault_output/dropout_decision_step_trace-episode_15.txt
 ```
 
-The `trace-episode_*.txt` files are readable per-simulator-step trajectories.
+The `*_trace-episode_*.txt` files are readable per-simulator-step trajectories.
 Every step lists every agent's effective high-level action. A newly selected
 action has status `new_high_level_decision`; on subsequent physical steps it
 is repeated with status `continuing`. A dropped agent is shown as
