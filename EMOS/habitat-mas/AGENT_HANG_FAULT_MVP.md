@@ -9,9 +9,15 @@ Habitat 发送全零 no-op。机器人实体仍在仿真中，其他 agent 和�
 
 Hang 的逻辑状态为 `logical_agent_active=True`、
 `logical_agent_responsive=False`；dropout 为 `logical_agent_active=False`。
-目前两者都抑制目标 agent 的执行，但 hang 不参与“全部 agent 都在 wait”时的
+Hang 保留成员身份和消息队列，发给它的请求正常入队但不会被读取或回复，也不向
+队友发送退出通知。Dropout 则从可用成员列表移除，清空未读消息，新请求立即反馈
+`agent_unavailable`；队友在下一次执行阶段 LLM 决策中看到成员退出信息。这个区别
+由共享消息通道执行，不仅是日志标签。两者的状态都在本步所有 agent 执行之前生效。
+
+两者都抑制目标 agent 的执行，但 hang 不参与“全部 agent 都在 wait”时的
 提前结束判定：只要有 agent 挂起，就跳过该终止捷径，episode 仍可由环境自身
 的成功、终止条件或步数上限结束。这里没有实际阻塞 Python 线程。
+目前不实现 Hang 的超时检测或 episode 内恢复；消息入队不代表对方已确认。
 
 初始群体讨论仍会完成；`simulator_step=0` 表示任务分配完成后，目标 agent
 从未开始执行。下一 episode 清除挂起状态，并按配置重新判断是否注入。

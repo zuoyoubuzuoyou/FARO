@@ -1,11 +1,12 @@
+import copy
+import json
 import re
 from typing import List, Optional
 
 from .crab_core import Action
+from .message_bus import AgentMessageBus
 from ..utils.models import OpenAIModel
 
-
-REQUEST_TEMPLATE = '"{source_agent}" agent sent you requests: "{request}".'
 
 PDDL_TARGET_PATTERN = re.compile(r"^(?:TARGET_)?any_targets\|\d+$")
 PDDL_TARGET_ARGUMENTS = {
@@ -14,7 +15,7 @@ PDDL_TARGET_ARGUMENTS = {
     "pick": ("target_obj",),
     "place": ("target_obj", "target_location"),
 }
-MAX_INVALID_TARGET_RETRIES = 2
+MAX_ACTION_CORRECTION_RETRIES = 2
 
 
 def _invalid_pddl_target_arguments(
@@ -47,12 +48,12 @@ ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE = (
 
 
 class CrabAgent:
-    message_pipe: dict[str, list[str]] = {}
+    message_pipe = AgentMessageBus.messages
 
     @classmethod
     def reset_message_pipe(cls) -> None:
-        """Discard unread inter-agent messages at an episode boundary."""
-        cls.message_pipe.clear()
+        """Reset communication and membership at an episode boundary."""
+        AgentMessageBus.reset()
 
     def __init__(
         self,
@@ -84,6 +85,7 @@ class CrabAgent:
         chat_history: Optional[List] = None,
         enable_logging: bool = False,
         logging_file: str = "",
+        skip_planning: bool = False,
     ):
         """This function is a hack to initialize agent after the object is created"""
         self.robot_type = robot_type
@@ -117,6 +119,9 @@ class CrabAgent:
         self.initialized = True
         self.start_act = False
 
+        if skip_planning:
+            return
+
         # Guide agent to decouple subtasks into actions
         if len(subtask_description) > 0:
             subtask_to_actions_prompt = (
@@ -138,7 +143,56 @@ class CrabAgent:
         print("===============CrabAgent Subtasks==============")
         print(response)
 
+    def export_replay_context(self) -> dict:
+        """Record model memory and communication at a high-level boundary."""
+        def encode(value):
+            return value.model_dump(mode="json")
+
+        return json.loads(json.dumps({
+            "robot_type": self.robot_type,
+            "task_description": self.task_description,
+            "subtask_description": self.subtask_description,
+            "system_message": self.llm_model.system_message,
+            "chat_history": self.llm_model.chat_history,
+            "start_act": self.start_act,
+            "token_usage": self.llm_model.token_usage,
+            "messages": AgentMessageBus.messages,
+            "members": sorted(AgentMessageBus.members),
+            "dropped_agents": sorted(AgentMessageBus.dropped_agents),
+        }, default=encode))
+
+    def restore_replay_context(self, context: dict) -> None:
+        context = copy.deepcopy(context)
+        for field in ("robot_type", "task_description", "subtask_description", "start_act"):
+            setattr(self, field, context[field])
+        self.llm_model.system_message = context["system_message"]
+        self.llm_model.chat_history = context["chat_history"]
+        self.llm_model.token_usage = context["token_usage"]
+        AgentMessageBus.messages.clear()
+        AgentMessageBus.messages.update(context["messages"])
+        AgentMessageBus.members = set(context["members"])
+        AgentMessageBus.dropped_agents = set(context["dropped_agents"])
+
+    def replay_decision(self, decision: dict) -> None:
+        if "replay_context" in decision:
+            self.restore_replay_context(decision["replay_context"])
+        else:
+            # Legacy traces lack the original assignment, model conversation and
+            # message bus. Keep an explicitly reconstructed decision history.
+            self.start_act = True
+            self.llm_model.chat_history.append([{
+                "role": "user",
+                "content": "Recorded high-level action selected at this point: "
+                + json.dumps({k: decision[k] for k in ("action", "arguments")})
+                + ". This is reconstructed execution history; the original conversation was not recorded.",
+            }])
+
     def chat(self, observation: str) -> Optional[dict]:
+        if self.name in AgentMessageBus.dropped_agents:
+            return {"name": "wait", "arguments": ["500"]}
+        membership = AgentMessageBus.membership_observation()
+        if membership:
+            observation = str(observation) + " " + membership
         if self.name in CrabAgent.message_pipe and CrabAgent.message_pipe[self.name]:
             prompt = " ".join(CrabAgent.message_pipe[self.name])
             observation = str(observation) + " " + prompt
@@ -146,15 +200,29 @@ class CrabAgent:
 
         action_name = "wait"
         parameters = {}
-        for attempt in range(MAX_INVALID_TARGET_RETRIES + 1):
+        for attempt in range(MAX_ACTION_CORRECTION_RETRIES + 1):
             action_name, parameters = self.llm_model.chat(str(observation))
+            if action_name == "send_request":
+                target_agent = parameters["target_agent"]
+                if target_agent == self.name:
+                    return None
+                error = AgentMessageBus.send_request(
+                    self.name, target_agent, parameters["request"]
+                )
+                if error is None or attempt == MAX_ACTION_CORRECTION_RETRIES:
+                    return {"name": "wait", "arguments": ["500"]}
+                observation = (
+                    f"{observation}\n{error} Choose another action or request "
+                    "help from a current team member."
+                )
+                continue
             invalid_targets = _invalid_pddl_target_arguments(
                 action_name, parameters
             )
             if not invalid_targets:
                 break
 
-            if attempt == MAX_INVALID_TARGET_RETRIES:
+            if attempt == MAX_ACTION_CORRECTION_RETRIES:
                 print(
                     f"Agent {self.name} repeatedly returned invalid PDDL "
                     "targets; using wait instead of forwarding an invalid "
@@ -172,20 +240,10 @@ class CrabAgent:
             )
             print(
                 f"Invalid PDDL target from {self.name}; retrying action "
-                f"generation ({attempt + 1}/{MAX_INVALID_TARGET_RETRIES}): "
+                f"generation ({attempt + 1}/{MAX_ACTION_CORRECTION_RETRIES}): "
                 f"{invalid_targets}"
             )
 
-        if action_name == "send_request":
-            target_agent = parameters["target_agent"]
-            if target_agent == self.name:  # send request to itself
-                return None
-            request = parameters["request"]
-            if target_agent not in CrabAgent.message_pipe:
-                CrabAgent.message_pipe[target_agent] = []
-            prompt = REQUEST_TEMPLATE.format(source_agent=self.name, request=request)
-            CrabAgent.message_pipe[target_agent].append(prompt)
-            return {"name": "wait", "arguments": ["500"]}
         if action_name == "wait":
             return {"name": "wait", "arguments": ["500"]}
         if action_name in [

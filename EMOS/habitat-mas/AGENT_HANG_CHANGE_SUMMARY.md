@@ -25,6 +25,11 @@ Hang 表示逻辑上仍存活但无响应，即 `logical_agent_active=True`、
 `logical_agent_responsive=False`。这与 Dropout 的
 `logical_agent_active=False` 区分开来。Hang 不会阻塞 Python 线程。
 
+通信层现在也区分二者：Dropout 移除可用成员、清空其未读消息，并对新请求返回
+`agent_unavailable`；其他 agent 在下一次 LLM 决策看到成员列表变化，失败的请求
+在当前决策内反馈给 LLM，最多重试两次。Hang 保留成员和消息队列，静默不读取消息。
+Dropout 事件为 `silent=False`，Hang 仍为 `silent=True`。
+
 支持两种 episode 匹配方式：
 
 - `episode_id` 配合单个 `simulator_step`；
@@ -36,8 +41,8 @@ agent 不存在、没有触发任何故障或计划中的注入步未到达时�
 
 ## 3. 策略和评估器集成
 
-`MultiLLMPolicy` 将原 Dropout 的零动作生成逻辑扩展为通用故障动作，并在每个
-agent 执行前推进 Hang 状态。事件仅在触发步产生一次，活动状态持续记录到
+`MultiLLMPolicy` 将原 Dropout 的零动作生成逻辑扩展为通用故障动作，并在本步
+所有 agent 执行前统一推进故障状态，避免消息结果依赖执行顺序。事件仅在触发步产生一次，活动状态持续记录到
 episode 结束。
 
 episode 初始化现在使用 mask 判断，而不是通过“上一动作是否全零”推断。这样
@@ -47,7 +52,7 @@ Hang 或 Dropout 持续产生零动作时不会错误地重新执行群体讨论
 - 高层决策计数；
 - 已激活的 Dropout 事件；
 - Hang 状态；
-- CrabAgent 中未读的跨 agent 消息。
+- CrabAgent 中未读的跨 agent 消息及成员退出状态。
 
 评估器统一选择当前启用的故障规格、事件记录器和轨迹命名，并支持同一数据集
 episode ID 被重复评估时刷新文本上下文。环境暂停时同步过滤 simulator step
@@ -78,14 +83,11 @@ python scripts/inject_fault.py [原 EMOS 参数] [错误注入简写参数]
 它会检查评估模式、环境数量、episode 次数、恢复配置和故障配置冲突，并拒绝
 静默覆盖不兼容的参数。
 
-每次运行会创建独立目录，包含：
+故障事件 JSONL、逐步轨迹 JSONL 和可读文本轨迹现在直接写入 `--output-dir`
+（默认 `fault_output/`），与正常运行的输出位置对齐。每次运行的辅助子目录包含
+`plan.json` 和 `episodes.json.gz`；计划中记录实际输出路径，终端也会显示路径。
 
-- `plan.json`：参数、数据集、episode、场景、注入步和最终命令；
-- `episodes.json.gz`：只含选中 episode 的数据子集；
-- 故障事件 JSONL；
-- 可选的逐步轨迹 JSONL 和可读文本轨迹。
-
-已存在的运行目录不会被覆盖。离线 `--dry-run` 可在 Habitat 依赖不可用时通过
+已存在的同名输出文件和运行目录不会被覆盖。离线 `--dry-run` 可在 Habitat 依赖不可用时通过
 显式数据集路径和最大 episode 步数生成计划，但不会验证完整 Hydra 配置和 agent
 列表。
 
@@ -103,7 +105,9 @@ hang_<label>_trajectory.jsonl
 ```
 
 如果 `run_label` 已经包含相同类型前缀，不会重复添加。文件名组件会进行安全化
-处理。
+处理。内部标签 `agent_dropout_X` 和 `agent_hang_X` 分别规范为 `dropout_X` 和
+`hang_X`，避免重复前缀。两类运行保留同一逐步记录结构，故障轨迹仍标记为
+`mode=faulty`，并包含实际故障状态。
 
 Hang 轨迹新增 `hang_state`、`agent_hang_noop` 和 `hang_noop` 状态。文本轨迹会
 标记触发 simulator step、当时的决策步以及挂起起点。Dropout 原有轨迹格式继续

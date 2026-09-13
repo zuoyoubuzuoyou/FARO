@@ -502,10 +502,17 @@ class StructureFaultConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class TrajectoryReplayConfig(HabitatBaselinesBaseConfig):
+    path: str = ""
+    atol: float = 1e-5
+
+
+@dataclass
 class FaultInjectionConfig(HabitatBaselinesBaseConfig):
     structure: StructureFaultConfig = field(
         default_factory=StructureFaultConfig
     )
+    replay: TrajectoryReplayConfig = field(default_factory=TrajectoryReplayConfig)
 
 
 @dataclass

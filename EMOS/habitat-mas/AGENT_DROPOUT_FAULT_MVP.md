@@ -2,16 +2,32 @@
 
 推荐使用[统一错误注入命令行](FAULT_INJECTION_CLI.md)，通过 `--fault`、`--episode` / `--random-episodes` 和 `--step` / `--trajectory` 指定注入。
 
-This MVP injects a permanent, silent, logical agent dropout using either a
+This MVP injects a permanent, observable, logical agent dropout using either a
 zero-based Habitat `simulator_step` or a zero-based, per-agent
 `high_level_decision` step.
 
 After the trigger, the selected agent:
 
 - no longer runs its execution-stage LLM or low-level policy;
-- does not process newly queued messages;
+- leaves the available team roster; peers see the membership update at their
+  next execution-stage LLM decision;
+- discards its unread inbox and rejects new requests with `agent_unavailable`;
 - keeps its policy state frozen;
 - sends an all-zero no-op action to Habitat.
+
+Failed `send_request` calls feed the transport error back to the sending LLM
+within the same decision, allowing it to choose another action or teammate.
+Correction attempts are bounded to two retries, followed by a wait fallback.
+All fault transitions happen before any individual policy runs in that step,
+including when the dropped recipient appears later in the dispatch order.
+The all-wait shortcut considers only remaining members. Episode reset restores
+membership and clears both messages and departure state.
+
+Unlike Dropout, Hang retains membership and accepts requests into an unread
+queue without notifying peers of a departure or returning an unavailable error.
+Both faults keep the physical robot in the simulator and suppress its actions.
+Dropout events now have `silent=False` and record member removal and rejected
+messages in `effects`; Hang remains `silent=True`.
 
 The physical robot entity remains in the simulator so the fixed multi-agent
 action and observation spaces do not change. Other agents and simulator
@@ -206,6 +222,7 @@ true on every later step. If the configured episode, agent, or step is never
 reached, evaluation raises `FaultInjectionError` rather than silently
 producing a mislabeled faulty run.
 
-This MVP does not implement dropout detection, task reassignment, recovery,
-temporary outages, or physical removal of the robot. Those belong to the
-subsequent fault-detection and correction layer.
+Membership removal is injected directly, not inferred by a failure detector.
+Peers can adapt to membership and transport feedback through their existing LLM
+policy. There is no automatic task reassignment, recovery within an episode,
+temporary outage, or physical removal of the robot.

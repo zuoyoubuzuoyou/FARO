@@ -249,7 +249,12 @@ class AgentDropoutTrajectoryRecorder:
                 active_actions[agent_name] = dict(override)
                 status = "fault_execution_override"
             elif isinstance(decision, Mapping):
-                active_actions[agent_name] = dict(decision)
+                # Full model memory is stored once in policy_info at the
+                # decision boundary, not repeated in every continuing step.
+                active_actions[agent_name] = {
+                    key: value for key, value in decision.items()
+                    if key != "replay_context"
+                }
                 status = "new_high_level_decision"
             elif bool(policy_info.get(dropout_key, False)):
                 status = "dropout_noop"

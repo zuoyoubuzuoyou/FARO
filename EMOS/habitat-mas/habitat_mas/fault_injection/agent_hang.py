@@ -96,6 +96,13 @@ def build_agent_hang_event(
         fault_subtype="AgentHang",
         logical_agent_active=True,
         logical_agent_responsive=False,
+        silent=True,
+    )
+    event["effects"].update(
+        incoming_messages="queued_not_processed",
+        queued_messages="retained",
+        team_membership="retained",
+        peer_observation="no_notification",
     )
     return event
 

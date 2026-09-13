@@ -172,7 +172,7 @@ class AgentDropoutFaultTest(unittest.TestCase):
         self.assertEqual(event["decision_step"], 2)
         self.assertEqual(event["simulator_step"], 87)
 
-    def test_event_describes_logical_silent_dropout(self):
+    def test_event_describes_observable_member_dropout(self):
         spec = AgentDropoutFaultSpec(
             enabled=True,
             fault_id="SF_test_001",
@@ -187,7 +187,9 @@ class AgentDropoutFaultTest(unittest.TestCase):
         self.assertEqual(event["fault_subtype"], "AgentDropout")
         self.assertEqual(event["phase"], "PRE_ACTION")
         self.assertEqual(event["simulator_step"], 12)
-        self.assertTrue(event["silent"])
+        self.assertFalse(event["silent"])
+        self.assertEqual(event["effects"]["team_membership"], "removed")
+        self.assertEqual(event["effects"]["incoming_messages"], "rejected_agent_unavailable")
         self.assertFalse(event["logical_agent_active"])
         self.assertFalse(event["simulator_agent_removed"])
         self.assertEqual(

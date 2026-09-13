@@ -26,6 +26,57 @@ env -u ALL_PROXY -u all_proxy python scripts/inject_fault.py \
 多个指定 episode 可写成 `--episode 28,49 --step 20`，并相应设置
 `habitat_baselines.test_episode_count=2`。
 
+## 沿 clean 轨迹回放，再注入错误
+
+`--replay-trajectory` 与 `--step` 配合使用。下面的命令读取已有 episode 20，
+复现并校验第 **0～39 步**，在第 **40 步执行动作前**让 agent_1 掉线：
+
+```bash
+python scripts/inject_fault.py \
+  --config-name=multi_rearrange/llm_spot_drone_per.yaml \
+  habitat_baselines.evaluate=True \
+  habitat_baselines.num_environments=1 \
+  habitat_baselines.test_episode_count=1 \
+  habitat.environment.iterator_options.shuffle=False \
+  --fault dropout --agent agent_1 --episode 20 --step 40 \
+  --replay-trajectory fault_output/clean_random10_seed42_trajectory.jsonl \
+  --run-label dropout_replay_episode20_step40
+```
+
+这与 `--trajectory` 不同：后者**仅从日志抽样注入步号**，不会回放。
+两者不能同时使用。回放要求 `1 <= step < clean 轨迹长度`；第 0 步注入没有
+共享前缀，直接使用普通 `--step 0`。支持 `dropout` 和 `hang`，也支持用
+`--random-episodes N --step T --replay-trajectory FILE` 选择有完整记录的 episode。
+选择的每个 episode 都必须有足够长的前缀，否则报错。
+
+回放前缀时不调用 leader 分工、LLM 子任务规划或 LLM 动作生成，而是复用记录的
+高层决策。底层技能仍逐步运行，正常更新当前技能、计数器、RNN 和前一步动作；
+不是把机器人坐标逐帧强行覆盖，也不是在注入点重新初始化策略。实际生成的联合
+环境动作必须与 clean 匹配，执行后还会检查机器人位置、朝向、持物状态、目标物体
+位置、奖励、done 以及记录中的任务指标。任何偏差都会立即停止，不能继续作为有效对照。
+数值比较使用绝对容差 `--replay-atol`，默认 `0.00001`；设置为 `0` 要求记录值精确相等。
+
+第 T 步起停止读取 clean 的动作与决策，按现有故障机制和实时观测正常执行。
+回放本身不增加自动接管机制：例如原先等待的 Spot 是否中断等待，由已有策略决定。
+
+新录制的轨迹在高层决策中保存 `replay_context`，包含任务分配、模型对话历史和
+通信队列，回放时恢复这些上下文。**旧日志没有这些信息时，仅能用已记录的决策
+重建历史**，事件标为 `context_fidelity=decision_history_only`；不能宣称原始
+LLM 记忆和通信完全相同。新记录完整时为 `context_fidelity=recorded`。
+若实验要求原始对话/通信也严格相同，应重新录制 clean 后配对运行。
+轨迹不是完整仿真或随机数快照，仍需保持场景、配置、代码版本、checkpoint 和种子一致；
+校验覆盖日志记录的字段，不证明未记录的关节、速度、传感器像素或随机状态完全相同。
+
+JSONL 额外包含以下事件（TXT 继续记录实际执行轨迹）：
+
+- `replay_start`：源文件、分叉步、容差和上下文完整性。
+- `replay_prefix_verified`：前缀全部匹配，`verified_steps=T`，下一步注入。
+- `replay_failed`：执行中发现偏差，记录首个错误字段并中止。
+
+`--dry-run` 可先检查源日志、目标 episode 和步数并生成计划，不运行模型或仿真。
+离线检查通过不表示实际物理轨迹已经匹配；运行时的 `replay_prefix_verified`
+才表示前缀通过校验。回放不支持 `--no-trajectory`，以保留校验结果和后续轨迹。
+
 ## 随机选择 episode 和注入步数
 
 ```bash
@@ -83,13 +134,28 @@ iterator 选项、仿真种子或 Hydra 工作目录。这些参数按原始命�
 ## 预览与输出
 
 在原命令后加 `--dry-run` 只生成计划和数据子集，不调用模型或启动仿真。
-输出默认在 `fault_output/<错误类型_时间戳>/`，包含：
+轨迹与正常运行使用相同记录器，并直接写入 `fault_output/`，例如在上面的
+Dropout 命令中加 `--run-label dropout_episode28_step40`，运行后得到：
 
-- `plan.json`：原始 EMOS 参数、错误类型、种子、场景、episode、步数和完整运行命令；
-- `episodes.json.gz`：选中的评估数据子集；
-- 对应错误类型的事件 JSONL、逐步轨迹 JSONL 和可读文本轨迹。
+```text
+fault_output/dropout_episode28_step40_trajectory.jsonl
+fault_output/dropout_episode28_step40_trace-episode_28.txt
+fault_output/dropout_episode28_step40_events.jsonl
+```
 
-`--output-dir` 修改输出根目录，`--run-label` 指定子目录；已有目录不会覆盖。
+JSONL 每个仿真步包含动作、agent 和对象状态、奖励、结束标记等；TXT 每步包含
+`Simulator_Step`、agent 位置/动作、对象位置及故障状态，与 clean 轨迹字段对齐。
+故障运行保留 `mode=faulty` 和实际故障标记，不改写成正常数据。Hang 使用 `hang_`
+前缀。默认标签为类型加时间戳，不再产生 `dropout_agent_dropout_` 这样的重复前缀。
+
+辅助文件保存在 `fault_output/<run_label>/`：
+
+- `plan.json`：参数、场景、episode、注入步、运行命令和 `outputs` 文件路径；
+- `episodes.json.gz`：选中的评估数据子集。
+
+`--output-dir` 修改轨迹输出目录，`--run-label` 指定文件标签及辅助文件子目录。
+已有同名输出文件或运行目录不会覆盖；重复实验需更换标签。终端会显示 JSONL 和
+每个 episode TXT 的完整路径。`--dry-run` 只显示这些预期路径，不生成轨迹内容。
 `--no-trajectory` 仅关闭轨迹记录，事件仍保留。
 `--config` 是 `--config-name` 的别名；`--dataset`、`--max-episode-steps` 是原数据集
 路径和环境步数上限参数的可选简写，两种写法同时出现且值不一致时会报错。
@@ -124,6 +190,7 @@ PYTHONPATH=habitat-mas python -m unittest \
   habitat_mas.test.test_fault_launcher \
   habitat_mas.test.test_agent_hang_fault \
   habitat_mas.test.test_agent_hang_policy \
+  habitat_mas.test.test_trajectory_replay \
   habitat_mas.test.test_agent_dropout_fault -v
 ```
 

@@ -16,6 +16,7 @@ from habitat_mas.fault_injection.launcher import (
     fault_overrides, make_schedule, normalize_fault, read_dataset,
     read_trace_steps, select_episodes,
 )
+from habitat_mas.fault_injection.trajectory import AgentDropoutTrajectoryRecorder
 
 
 def episode(number, scene="scene_a"):
@@ -70,6 +71,52 @@ class FaultLauncherTest(unittest.TestCase):
         self.assertIn("habitat_baselines.fault_injection.structure.agent_dropout.enabled=False", command)
         with self.assertRaises(FileExistsError):
             prepare_run(args, [])
+
+    def test_fault_outputs_use_clean_layout_and_announced_paths(self):
+        for fault in ("dropout", "hang"):
+            with self.subTest(fault=fault):
+                args = self.args("--fault", fault, "--episode", "2", "--step", "0",
+                                 "--run-label", f"agent_{fault}_comparison")
+                plan_path, command, plan = prepare_run(args, [])
+                prefix = f"habitat_baselines.fault_injection.structure.agent_{fault}"
+                values = dict(arg.split("=", 1) for arg in command if arg.startswith(prefix))
+                recorder = AgentDropoutTrajectoryRecorder(
+                    json.loads(values[f"{prefix}.output_dir"]),
+                    json.loads(values[f"{prefix}.run_label"]), "faulty",
+                    agent_names=["agent_0"], fault_name=f"agent_{fault}",
+                )
+                self.assertEqual(recorder.path, self.root / "runs" / f"{fault}_comparison_trajectory.jsonl")
+                self.assertEqual(str(recorder.path), plan["outputs"]["trajectory"])
+                self.assertEqual(str(recorder.text_path_for_episode("2")), plan["outputs"]["traces"][0])
+                self.assertNotEqual(recorder.path.parent, plan_path.parent)
+                recorder.record_episode_start(episode_id="2", scene_id="scene_a", text_context={})
+                recorder.record_step(
+                    episode_id="2", scene_id="scene_a", simulator_step=0,
+                    joint_env_action=[0], policy_info={}, reward=0, done=True, metrics={},
+                )
+                row = json.loads(recorder.path.read_text().splitlines()[-1])
+                self.assertEqual(row["type"], "simulator_step")
+                self.assertTrue({"agent_step_actions", "simulator_state", "joint_env_action"} <= row.keys())
+                self.assertIn("Simulator_Step: 0", recorder.text_path_for_episode("2").read_text())
+
+    def test_existing_flat_outputs_are_not_overwritten(self):
+        directory = self.root / "runs"
+        directory.mkdir()
+        for suffix in ("trajectory.jsonl", "events.jsonl", "trace-episode_1.txt"):
+            with self.subTest(suffix=suffix):
+                existing = directory / f"hang_preserved_{suffix}"
+                existing.write_text("existing output")
+                with self.assertRaisesRegex(FileExistsError, "choose another --run-label"):
+                    prepare_run(self.args("--episode", "1", "--step", "0", "--run-label", "preserved"), [])
+                self.assertEqual(existing.read_text(), "existing output")
+                self.assertFalse((directory / "preserved").exists())
+                existing.unlink()
+
+    def test_no_trajectory_does_not_announce_nonexistent_trace_files(self):
+        _, command, plan = prepare_run(self.args("--episode", "1", "--step", "0", "--no-trajectory"), [])
+        self.assertIsNone(plan["outputs"]["trajectory"])
+        self.assertEqual(plan["outputs"]["traces"], [])
+        self.assertIn("habitat_baselines.fault_injection.structure.agent_hang.record_trajectory=False", command)
 
     def test_random_plans_reproduce_and_follow_each_clean_length(self):
         results = []

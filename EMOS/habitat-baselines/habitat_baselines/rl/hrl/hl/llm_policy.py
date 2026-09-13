@@ -1,4 +1,5 @@
 # ruff: noqa
+import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -14,6 +15,7 @@ from habitat_mas.agents.dummy_agent import DummyAgent
 from habitat_baselines.rl.hrl.hl.high_level_policy import HighLevelPolicy
 from habitat_baselines.rl.ppo.policy import PolicyActionData
 from habitat_mas.utils import AgentArguments
+from habitat_mas.fault_injection.replay import ReplayMismatchError
 
 ACTION_POOL = [send_request, nav_to_obj, pick, place, reset_arm, wait]
 
@@ -135,6 +137,26 @@ class LLMHighLevelPolicy(HighLevelPolicy):
 
         for batch_idx, should_plan in enumerate(plan_masks):
             if should_plan != 1.0:
+                continue
+
+            replay_row = kwargs.get("replay_row")
+            if replay_row is not None:
+                key = f"{self.llm_agent.name}_high_level_decision"
+                decision = replay_row["policy_info"].get(key)
+                if decision is None:
+                    raise ReplayMismatchError(
+                        f"step {replay_row['simulator_step']}: unexpected decision for {self.llm_agent.name}"
+                    )
+                if decision["action"] not in self._skill_name_to_idx:
+                    raise ReplayMismatchError(f"Recorded skill unavailable: {decision['action']}")
+                next_skill[batch_idx] = self._skill_name_to_idx[decision["action"]]
+                # Arguments were recorded after _parse_function_call_args.
+                skill_args_data[batch_idx] = copy.deepcopy(decision["arguments"])
+                self.llm_agent.replay_decision(decision)
+                policy_info[batch_idx]["high_level_decision"] = {
+                    "agent": self.llm_agent.name,
+                    "action": decision["action"], "arguments": copy.deepcopy(decision["arguments"]),
+                }
                 continue
 
             # Query the LLM agent with the current observations

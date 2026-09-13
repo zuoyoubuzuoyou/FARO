@@ -35,6 +35,9 @@ class AgentHangFaultTest(unittest.TestCase):
         self.assertFalse(event["logical_agent_responsive"])
         self.assertFalse(event["simulator_agent_removed"])
         self.assertTrue(event["silent"])
+        self.assertEqual(event["effects"]["team_membership"], "retained")
+        self.assertEqual(event["effects"]["incoming_messages"], "queued_not_processed")
+        self.assertEqual(event["effects"]["queued_messages"], "retained")
         self.assertEqual(event["effects"]["policy_state"], "frozen")
         for step in (40, 41, 750, 10000):
             self.assertIsNone(self.advance(state, spec, step))

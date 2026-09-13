@@ -1,5 +1,6 @@
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Dict, List
 
 import numpy as np
@@ -37,6 +38,7 @@ from habitat_mas.fault_injection.agent_hang import (
 from habitat_mas.fault_injection.trajectory import (
     AgentDropoutTrajectoryRecorder,
 )
+from habitat_mas.fault_injection.replay import CleanPrefixReplay
 
 class HabitatMASEvaluator(Evaluator):
     """
@@ -76,6 +78,16 @@ class HabitatMASEvaluator(Evaluator):
         fault_spec = hang_spec if use_hang else dropout_spec
         fault_config = agent_hang_fault if use_hang else agent_dropout_fault
         fault_name = "agent_hang" if use_hang else "agent_dropout"
+        replay_config = config.habitat_baselines.fault_injection.replay
+        replay = CleanPrefixReplay(replay_config.path, atol=replay_config.atol) if replay_config.path else None
+        if replay is not None:
+            if (not fault_spec.enabled or not fault_config.record_trajectory
+                    or config.habitat_baselines.num_environments != 1
+                    or config.habitat_baselines.eval.evals_per_ep != 1
+                    or getattr(fault_spec, "trigger_domain", "simulator_step") != "simulator_step"):
+                raise ValueError("Replay requires a simulator-step fault, trajectory recording, one environment and one evaluation per episode")
+            if not is_continuous_action_space(env_spec.action_space):
+                raise ValueError("Clean prefix replay currently requires a continuous joint action space")
         if (
             fault_spec.enabled
             and fault_spec.agent not in config.habitat.simulator.agents
@@ -230,6 +242,16 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+                    if replay is not None:
+                        ep = current_episodes_info[i]
+                        schedule = fault_spec.simulator_step_schedule_map()
+                        if ((schedule and str(ep.episode_id) not in schedule)
+                                or (fault_spec.episode_id and str(ep.episode_id) != fault_spec.episode_id)):
+                            raise ValueError(f"Replay episode {ep.episode_id} has no scheduled injection")
+                        branch_step = schedule.get(str(ep.episode_id), fault_spec.simulator_step)
+                        event = replay.start_episode(ep.scene_id, ep.episode_id, branch_step, config.habitat.simulator.agents.keys())
+                        trajectory_recorder.record(event)
+                        logger.info(f"Clean prefix replay: {event}")
                     if trajectory_recorder is not None:
                         trajectory_recorder.record_episode_start(
                             episode_id=current_episodes_info[i].episode_id,
@@ -238,13 +260,14 @@ class HabitatMASEvaluator(Evaluator):
                         )
 
             space_lengths = {}
+            replay_row = replay.prefix_row(simulator_steps[0]) if replay is not None else None
             n_agents = len(config.habitat.simulator.agents)
             if n_agents > 1:
                 space_lengths = {
                     "index_len_recurrent_hidden_states": hidden_state_lens,
                     "index_len_prev_actions": action_space_lens,
                 }
-            with inference_mode():
+            with (replay.record_failures(trajectory_recorder) if replay_row is not None else nullcontext()), inference_mode():
                 action_data = agent.actor_critic.act(
                     batch,
                     test_recurrent_hidden_states,
@@ -255,6 +278,9 @@ class HabitatMASEvaluator(Evaluator):
                     agent_dropout_fault=agent_dropout_fault,
                     agent_hang_fault=agent_hang_fault,
                     simulator_steps=simulator_steps,
+                    trajectory_replay=replay,
+                    replay_row=replay_row,
+                    record_replay_context=trajectory_recorder is not None,
                     **space_lengths,
                 )
                 if action_data.should_inserts is None:
@@ -292,6 +318,16 @@ class HabitatMASEvaluator(Evaluator):
             else:
                 step_data = [a.item() for a in action_data.env_actions.cpu()]
 
+            if replay_row is not None:
+                try:
+                    replay.verify_action(
+                        replay_row, step_data[0].tolist(),
+                        action_data.policy_info[0] if action_data.policy_info is not None else {},
+                    )
+                except ValueError as error:
+                    trajectory_recorder.record({**replay.report("replay_failed"), "error": str(error)})
+                    raise
+
             outputs = envs.step(step_data)
 
             observations, rewards_l, dones, infos = [
@@ -307,7 +343,13 @@ class HabitatMASEvaluator(Evaluator):
                 action_data, infos, dones
             )
             for i in range(len(policy_infos)):
-                infos[i].update(policy_infos[i])
+                # Model memory belongs in the JSONL, not scalar metrics or
+                # video overlays. Do not mutate action_data.policy_info.
+                infos[i].update({
+                    key: {field: item for field, item in value.items() if field != "replay_context"}
+                    if key.endswith("_high_level_decision") and isinstance(value, dict) else value
+                    for key, value in policy_infos[i].items()
+                })
 
             observations = envs.post_step(observations)
             batch = batch_obs(  # type: ignore
@@ -364,6 +406,19 @@ class HabitatMASEvaluator(Evaluator):
                         text_context=trajectory_text_contexts[i],
                         simulator_state=dynamic_state_snapshots[i],
                     )
+            if replay_row is not None:
+                try:
+                    replay.verify_result(
+                        replay_row, dynamic_state_snapshots[0], rewards_l[0], dones[0],
+                        extract_scalars_from_info(infos[0]),
+                    )
+                except ValueError as error:
+                    trajectory_recorder.record({**replay.report("replay_failed"), "error": str(error)})
+                    raise
+                if replay.verified_steps == replay.branch_step:
+                    event = replay.report("replay_prefix_verified")
+                    trajectory_recorder.record(event)
+                    logger.info(f"Clean prefix verified; next step injects the fault: {event}")
             next_episodes_info = envs.current_episodes()
             envs_to_pause = []
             n_envs = envs.num_envs

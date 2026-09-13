@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from habitat_mas.agents.message_bus import AgentMessageBus
 from habitat_mas.fault_injection.agent_dropout import (
     AgentDropoutFaultSpec, FaultInjectionError, build_agent_dropout_event,
 )
@@ -47,6 +48,7 @@ def load_dispatch():
     cls.body = methods
     namespace = {
         "os": os,
+        "AgentMessageBus": AgentMessageBus,
         "AgentDropoutFaultSpec": AgentDropoutFaultSpec,
         "AgentHangFaultSpec": AgentHangFaultSpec,
         "AgentHangState": AgentHangState,
@@ -65,6 +67,8 @@ def load_dispatch():
 
 class AgentHangPolicyTest(unittest.TestCase):
     def setUp(self):
+        AgentMessageBus.reset()
+        self.addCleanup(AgentMessageBus.reset)
         cls, self.namespace = load_dispatch()
         self.policy = cls()
         self.policy._decision_steps = {}
@@ -76,7 +80,7 @@ class AgentHangPolicyTest(unittest.TestCase):
         for _ in range(2):
             llm = SimpleNamespace(initialized=True)
             llm.init_agent = lambda llm=llm, **kwargs: setattr(llm, "initialized", True)
-            llm.reset_message_pipe = MagicMock()
+            llm.reset_message_pipe = MagicMock(side_effect=AgentMessageBus.reset)
             agent = SimpleNamespace(
                 _high_level_policy=SimpleNamespace(llm_agent=llm),
                 _cur_call_high_level=[tensor(1)], _name_to_idx={"wait": 0}, _stop_action_idx=0,
@@ -183,8 +187,71 @@ class AgentHangPolicyTest(unittest.TestCase):
             self.act(0, {"enabled": True, "agent": "agent_5"})
         with self.assertRaisesRegex(FaultInjectionError, "both be enabled"):
             self.act(0, {"enabled": True}, dropout={"enabled": True})
+        with self.assertRaisesRegex(FaultInjectionError, "unknown"):
+            self.act(0, {}, dropout={"enabled": True, "agent": "agent_5"})
         for agent in self.agents:
             agent.act.assert_not_called()
+
+    def test_dropout_is_unreachable_before_any_peer_executes(self):
+        for target in (0, 1):
+            with self.subTest(target=target):
+                observations = []
+                peer = self.agents[1 - target]
+                original = peer.act.side_effect
+
+                def send(*args, **kwargs):
+                    observations.append((
+                        AgentMessageBus.active_members(),
+                        AgentMessageBus.send_request(
+                            f"agent_{1 - target}", f"agent_{target}", "help"
+                        ),
+                    ))
+                    return original(*args, **kwargs)
+
+                peer.act.side_effect = send
+                self.act(0, {}, starting=True, dropout={
+                    "enabled": True, "agent": f"agent_{target}",
+                })
+                peer.act.side_effect = original
+                self.assertEqual(observations[0][0], [f"agent_{1 - target}"])
+                self.assertIn("agent_unavailable", observations[0][1])
+                self.assertNotIn(f"agent_{target}", AgentMessageBus.messages)
+
+    def test_hang_keeps_membership_and_unread_requests_until_reset(self):
+        config = {"enabled": True, "agent": "agent_1", "episode_id": "15"}
+        self.act(0, config, starting=True)
+        self.assertEqual(AgentMessageBus.active_members(), ["agent_0", "agent_1"])
+        self.assertEqual(AgentMessageBus.membership_observation(), "")
+        self.assertIsNone(AgentMessageBus.send_request("agent_0", "agent_1", "help"))
+        self.act(1, config)
+        self.assertEqual(len(AgentMessageBus.messages["agent_1"]), 1)
+        self.agents[1].act.assert_not_called()
+        self.act(0, config, episode="16", starting=True)
+        self.assertEqual(AgentMessageBus.messages, {})
+        self.assertEqual(self.agents[1].act.call_count, 1)
+
+    def test_decision_dropout_discards_inbox_and_next_episode_rejoins(self):
+        config = {
+            "enabled": True, "agent": "agent_1", "episode_id": "15",
+            "trigger_domain": "high_level_decision", "decision_step": 1,
+        }
+        self.act(0, {}, starting=True, dropout=config)
+        AgentMessageBus.send_request("agent_0", "agent_1", "pending")
+        self.agents[1]._cur_call_high_level = [tensor(0)]
+        original = self.agents[1].act.side_effect
+        self.agents[1].act.side_effect = lambda *a, **kw: SimpleNamespace(
+            policy_info=[{}], skill_id=0, actions=tensor(),
+        )
+        self.act(1, {}, dropout=config)
+        self.agents[1].act.side_effect = original
+        self.assertEqual(AgentMessageBus.dropped_agents, set())
+        self.agents[1]._cur_call_high_level = [tensor(1)]
+        self.act(2, {}, dropout=config)
+        self.assertEqual(AgentMessageBus.active_members(), ["agent_0"])
+        self.assertNotIn("agent_1", AgentMessageBus.messages)
+        self.act(0, {}, episode="16", starting=True, dropout=config)
+        self.assertEqual(AgentMessageBus.active_members(), ["agent_0", "agent_1"])
+        self.assertIsNone(AgentMessageBus.send_request("agent_0", "agent_1", "new"))
 
 
 if __name__ == "__main__":

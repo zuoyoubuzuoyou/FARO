@@ -3,6 +3,41 @@
 本指南使用 EMOS 原始入口 `python -u -m habitat_baselines.run`，保留原有
 `--config-name` 和 Hydra `key=value` 参数。
 
+## 命令行直接指定 episode（推荐）
+
+现在可以直接运行，不用手动准备单 episode 数据文件：
+
+```bash
+conda activate habitat
+cd /home/dyc/Projects/FARO/EMOS
+python scripts/run_clean.py --episode 20 --run-label clean_episode20_replay_v3
+```
+
+这个入口默认使用 `multi_rearrange/llm_spot_drone_per.yaml`，关闭 dropout、hang
+和轨迹回放，开启正常轨迹记录（包括高层决策处的 `replay_context`）。默认使用
+单环境评估选中的全部 episode，每个 episode 一次，并关闭旧检查点配置恢复。
+显式提供的 EMOS 参数会保留；若与单环境评估要求冲突则报错。模型、仿真种子和
+其他参数沿用配置，可以继续在命令后追加原有 Hydra `key=value` 参数。
+
+`--episode` 指数据中的 ID，不是数据集下标。脚本从原始数据集筛选匹配条目，
+自动把子集和 `plan.json` 保存到 `fault_output/<run_label>/`，再调用原始评估入口。
+原始数据集及 episode ID 不修改。ID 在多个场景重复时，用 `--scene` 指定场景。
+
+支持 `--episode 20,28`、`--random-episodes 10 --seed 42`，以及 `--config-name`、
+`--dataset`、`--output-dir`、`--dry-run`。`--seed` 仅控制 episode 抽样；
+仿真种子仍使用 `habitat.seed` 等原有参数。与原始入口不同，简写入口拒绝覆盖
+已有同名输出；重复执行或在 dry-run 后正式运行时请换一个 `--run-label`。
+
+上面的命令生成：
+
+```text
+fault_output/clean_episode20_replay_v3_trajectory.jsonl
+fault_output/clean_episode20_replay_v3_trace-episode_20.txt
+```
+
+后续故障命令将 `--replay-trajectory` 指向这个新的 JSONL 即可。
+`--help` 查看完整选项。以下原始入口的用法也继续支持。
+
 python -u -m habitat_baselines.run \
   --config-name=multi_rearrange/llm_spot_drone_per.yaml \
   habitat_baselines.evaluate=True \

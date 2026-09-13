@@ -23,6 +23,14 @@ def output_run_stem(run_label: object, output_type: object) -> str:
     canonical_type = raw_type.removeprefix("agent_")
     safe_type = safe_output_component(canonical_type) or "unknown"
     safe_label = safe_output_component(run_label)
+    # Launcher/internal labels may already include the full fault name.
+    # Treat agent_dropout_X exactly like dropout_X, without a second prefix.
+    if raw_type.startswith("agent_") and (
+        safe_label == raw_type or safe_label.startswith(
+            (f"{raw_type}_", f"{raw_type}-", f"{raw_type}.")
+        )
+    ):
+        safe_label = safe_label.removeprefix("agent_")
     if not safe_label:
         return safe_type
     if safe_label == safe_type or safe_label.startswith(

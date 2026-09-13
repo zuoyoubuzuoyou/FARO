@@ -12,6 +12,7 @@ import gym.spaces as spaces
 import numpy as np
 import torch
 from habitat_mas.agents.actions.discussion_actions import *
+from habitat_mas.agents.message_bus import AgentMessageBus
 from habitat_mas.fault_injection.agent_dropout import (
     AgentDropoutFaultSpec,
     FaultInjectionError,
@@ -604,15 +605,18 @@ class MultiLLMPolicy(MultiPolicy):
             raise FaultInjectionError(
                 "agent_dropout and agent_hang cannot both be enabled"
             )
-        if hang_spec.enabled and hang_spec.agent not in {
-            f"agent_{i}" for i in range(n_agents)
-        }:
-            raise FaultInjectionError(
-                f"unknown agent_hang.agent: {hang_spec.agent}"
-            )
+        for fault_name, spec in (("dropout", dropout_spec), ("hang", hang_spec)):
+            if spec.enabled and spec.agent not in {
+                f"agent_{i}" for i in range(n_agents)
+            }:
+                raise FaultInjectionError(
+                    f"unknown agent_{fault_name}.agent: {spec.agent}"
+                )
         simulator_steps = kwargs.get("simulator_steps")
         if simulator_steps is None:
             simulator_steps = [0 for _ in range(n_envs)]
+        replay = kwargs.get("trajectory_replay")
+        replay_row = kwargs.get("replay_row")
 
         text_goal = observations["pddl_text_goal"][0].tolist()
         text_goal = "".join([chr(code) for code in text_goal]).strip()
@@ -650,7 +654,7 @@ class MultiLLMPolicy(MultiPolicy):
                 # print(text_goal)
                 # print("=============================================")
                 
-                agent_arguments = group_discussion(
+                agent_arguments = {} if replay is not None else group_discussion(
                     robot_resume, 
                     scene_description, 
                     text_goal, 
@@ -672,18 +676,12 @@ class MultiLLMPolicy(MultiPolicy):
                     policy._high_level_policy.llm_agent.initialized = False
                     
 
-        # Stage 2: Individual policy actions
-        agent_actions = []
+        # Apply all faults before any agent executes or sends a request, so
+        # same-step communication does not depend on agent dispatch order.
+        AgentMessageBus.members = {f"agent_{i}" for i in range(n_agents)}
+        agent_fault_states = []
         for agent_i, policy in enumerate(self._active_policies):
-            # collect assigned tasks for agent_i across all envs
             agent_i_handle = f"agent_{agent_i}"
-            # Default 1 environment
-            select_agent_arguments = [
-                arguments[agent_i_handle] if agent_i_handle in arguments else None
-                for arguments in envs_agent_arguments
-            ]
-            agent_obs = self._update_obs_with_agent_prefix_fn(observations, agent_i)
-
             dropout_active = []
             dropout_events = []
             active_dropout_events = []
@@ -724,6 +722,7 @@ class MultiLLMPolicy(MultiPolicy):
                         decision_step=decision_step,
                     )
                     self._active_dropout_events[state_key] = trigger_event
+                    AgentMessageBus.drop_agent(agent_i_handle)
 
                 active_event = self._active_dropout_events.get(state_key)
                 dropout_active.append(active_event is not None)
@@ -743,6 +742,25 @@ class MultiLLMPolicy(MultiPolicy):
                     )
                 )
                 active_hang_events.append(hang_state.active_event)
+
+            agent_fault_states.append((
+                dropout_active, dropout_events, active_dropout_events,
+                agent_decision_steps, hang_events, active_hang_events,
+            ))
+
+        # Stage 2: Individual policy actions
+        agent_actions = []
+        for agent_i, policy in enumerate(self._active_policies):
+            agent_i_handle = f"agent_{agent_i}"
+            select_agent_arguments = [
+                arguments.get(agent_i_handle)
+                for arguments in envs_agent_arguments
+            ]
+            agent_obs = self._update_obs_with_agent_prefix_fn(observations, agent_i)
+            (
+                dropout_active, dropout_events, active_dropout_events,
+                agent_decision_steps, hang_events, active_hang_events,
+            ) = agent_fault_states[agent_i]
 
             if any(dropout_active):
                 if not all(dropout_active):
@@ -786,6 +804,22 @@ class MultiLLMPolicy(MultiPolicy):
             if not llm_policy.llm_agent.initialized:
                 print("=================agent_task_assignment===================")
                 args = select_agent_arguments[0]
+                if replay is not None:
+                    initial = replay.initial_decision(agent_i_handle)
+                    context = initial.get("replay_context")
+                    # Old traces contain actions but not the discussion. Never
+                    # rerun the leader and silently change the clean assignment.
+                    resume = json.loads(envs_text_context[0]["robot_resume"])
+                    args = AgentArguments(
+                        robot_id=agent_i_handle,
+                        robot_type=context["robot_type"] if context else resume[agent_i_handle]["robot_type"],
+                        task_description=context["task_description"] if context else text_goal,
+                        subtask_description=context["subtask_description"] if context else (
+                            "Continue the recorded execution history toward the overall task. "
+                            "The original subtask assignment was not recorded."
+                        ),
+                        chat_history=None,
+                    )
                 print(args)
                 episode_id = envs_text_context[0]["episode_id"]
                 episode_save_dir = os.path.join(save_chat_history_dir, str(episode_id))
@@ -798,6 +832,7 @@ class MultiLLMPolicy(MultiPolicy):
                     chat_history=args.chat_history,
                     enable_logging=save_chat_history,
                     logging_file=logging_path,
+                    **({"skip_planning": True} if replay is not None else {}),
                 )
 
             # Run the policy
@@ -809,12 +844,15 @@ class MultiLLMPolicy(MultiPolicy):
                 deterministic,
                 envs_text_context=envs_text_context,
                 agent_arguments=select_agent_arguments,
+                replay_row=replay_row,
             )
             if agent_action.policy_info is not None:
                 for env_i, info in enumerate(agent_action.policy_info):
                     decision = info.get("high_level_decision")
                     if decision is None:
                         continue
+                    if kwargs.get("record_replay_context", False):
+                        decision["replay_context"] = llm_policy.llm_agent.export_replay_context()
                     decision["decision_step"] = agent_decision_steps[env_i]
                     decision["simulator_step"] = int(
                         simulator_steps[env_i]
@@ -836,6 +874,11 @@ class MultiLLMPolicy(MultiPolicy):
         if self.should_terminate_on_wait and not any_agent_hung:
             should_terminate = True
             for agent_id, agent_action in enumerate(agent_actions):
+                if any(
+                    info.get("dropout_active", False)
+                    for info in (agent_action.policy_info or [])
+                ):
+                    continue
                 wait_id = self._active_policies[agent_id]._name_to_idx['wait']
                 if agent_action.skill_id != wait_id:
                     should_terminate = False
@@ -845,7 +888,7 @@ class MultiLLMPolicy(MultiPolicy):
                 print("All agents are waiting for next action.")
                 print("===========================================")
                 for agent_i, policy in enumerate(self._active_policies):
-                    agent_actions[agent_i].actions[i, policy._stop_action_idx] = 1.0
+                    agent_actions[agent_i].actions[:, policy._stop_action_idx] = 1.0
 
         policy_info = _merge_list_dict(
             [ac.policy_info for ac in agent_actions]
