@@ -47,8 +47,9 @@ class CleanLauncherTest(unittest.TestCase):
         self.assertTrue(plan["outputs"]["trajectory"].endswith("clean_ep20_trajectory.jsonl"))
         for fault in ("agent_dropout", "agent_hang"):
             self.assertIn(f"habitat_baselines.fault_injection.structure.{fault}.enabled=False", command)
-        self.assertIn("habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True", command)
-        self.assertIn("habitat_baselines.fault_injection.structure.agent_hang.record_trajectory=False", command)
+        self.assertIn("habitat_baselines.trajectory.enabled=True", command)
+        self.assertIn(f'habitat_baselines.output_dir="{self.root / "runs"}"', command)
+        self.assertIn('habitat_baselines.run_label="clean_ep20"', command)
         self.assertIn('habitat_baselines.fault_injection.replay.path=""', command)
         self.assertIn("habitat_baselines.num_environments=1", command)
         self.assertIn("habitat_baselines.test_episode_count=-1", command)

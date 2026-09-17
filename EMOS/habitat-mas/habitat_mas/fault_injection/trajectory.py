@@ -358,6 +358,17 @@ class AgentDropoutTrajectoryRecorder:
             "objects": raw_state.get("objects", []),
         }
 
+    def record_system_crash(self, report, *, terminal_step_recorded=False):
+        """A pre-action abort is a terminal event, never a fabricated env step."""
+        self.record(report)
+        lines = [f"System_Crash: reason={report['reason']}, agent={report['agent']}, "
+                 f"detected_step={report['simulator_step']}, phase={report['phase']}, "
+                 f"completed_steps={report['completed_steps']}, consecutive_count={report['consecutive_count']}"]
+        if not terminal_step_recorded:
+            lines.append("Episode_Result: done=True, termination_reason=error_detection, "
+                         + ", ".join(f"{key}={value}" for key, value in report["metrics"].items()))
+        self._append_text(report["episode_id"], "\n".join(lines) + "\n\n")
+
     def record_step(
         self,
         *,

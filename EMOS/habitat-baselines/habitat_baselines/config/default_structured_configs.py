@@ -470,9 +470,6 @@ class AgentDropoutFaultConfig(HabitatBaselinesBaseConfig):
     # Zero-based, per-agent high-level decision index. Agents decide
     # asynchronously, so each agent owns an independent counter.
     decision_step: int = 0
-    record_trajectory: bool = False
-    output_dir: str = "fault_output"
-    run_label: str = "agent_dropout"
 
 
 @dataclass
@@ -488,9 +485,6 @@ class AgentHangFaultConfig(HabitatBaselinesBaseConfig):
     simulator_step: int = 0
     # Optional "episode_id@step;..." schedule, exclusive with episode_id.
     simulator_step_schedule: str = ""
-    record_trajectory: bool = False
-    output_dir: str = "fault_output"
-    run_label: str = "agent_hang"
 
 
 @dataclass
@@ -516,7 +510,27 @@ class FaultInjectionConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class TrajectoryConfig(HabitatBaselinesBaseConfig):
+    """Record simulator-step trajectories in clean and fault evaluations."""
+
+    enabled: bool = False
+
+
+@dataclass
+class ErrorDetectionConfig(HabitatBaselinesBaseConfig):
+    enabled: bool = True
+    hang_steps: int = 10
+    repeated_message_limit: int = 10
+
+
+@dataclass
 class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
+    trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
+    # Shared by trajectories, fault events and detected-crash reports.
+    output_dir: str = "fault_output"
+    # An empty label uses the actual run type: clean, dropout or hang.
+    run_label: str = ""
+    error_detection: ErrorDetectionConfig = field(default_factory=ErrorDetectionConfig)
     # task config can be a list of configs like "A.yaml,B.yaml"
     # If habitat_baselines.evaluate is true, the run will be in evaluation mode
     # replaces --run-type eval when true

@@ -1,4 +1,6 @@
 import os
+import json
+from pathlib import Path
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any, Dict, List
@@ -39,13 +41,58 @@ from habitat_mas.fault_injection.trajectory import (
     AgentDropoutTrajectoryRecorder,
 )
 from habitat_mas.fault_injection.replay import CleanPrefixReplay
+from habitat_mas.fault_injection.naming import output_run_stem
+from habitat_mas.error_detection import ErrorDetector, ErrorDetectionSpec, DetectedSystemCrash, progress_signature
+from habitat_mas.agents.message_bus import AgentMessageBus
 
 class HabitatMASEvaluator(Evaluator):
     """
     Evaluator for Habitat environments.
     """
 
-    def evaluate_agent(
+    def evaluate_agent(self, agent, envs, config, checkpoint_index, step_id, writer,
+                       device, obs_transforms, env_spec, rank0_keys):
+        try:
+            return self._evaluate_agent(agent, envs, config, checkpoint_index, step_id,
+                                        writer, device, obs_transforms, env_spec, rank0_keys)
+        except DetectedSystemCrash as error:
+            # Only explicitly detected runtime faults become a simulated crash.
+            # Configuration bugs, replay mismatches and API failures still raise
+            # their original exceptions instead of being mislabeled.
+            try:
+                self._record_system_crash(error, writer, step_id)
+            finally:
+                envs.close()  # All agents stop; no later episode is dispatched.
+                self._crash_context["pbar"].close()
+            raise SystemExit(3)
+
+    def _record_system_crash(self, error, writer, step_id):
+        context = self._crash_context
+        detector = context["detector"]
+        for event in error.fault_events:
+            if context["fault_recorder"] is not None:
+                context["fault_recorder"].record(event)
+        metrics = {**context["metrics"], **detector.metrics(), "pddl_success": 0.0,
+                   "num_steps": float(context["completed_steps"]),
+                   "error_detection.detected_step": float(error.event["simulator_step"])}
+        report = {**error.event, "done": True, "completed_steps": context["completed_steps"],
+                  "env_step_executed": context["transition"] is not None,
+                  "reward_total": context["reward_total"], "metrics": metrics,
+                  "simulator_state": context["last_state"],
+                  "termination_reason": "error_detection", "exit_code": 3}
+        recorder = context["trajectory_recorder"]
+        if recorder is not None:
+            if context["transition"] is not None:
+                recorder.record_step(**context["transition"], done=True, metrics=metrics)
+            recorder.record_system_crash(report, terminal_step_recorded=context["transition"] is not None)
+        context["report_path"].parent.mkdir(parents=True, exist_ok=True)
+        context["report_path"].write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        logger.error(f"SIMULATED SYSTEM CRASH: {error}. Completed env steps: {context['completed_steps']}. Report: {context['report_path']}")
+        writer.add_scalar("eval_reward/average_reward", context["reward_total"], step_id)
+        for name, value in metrics.items():
+            writer.add_scalar(f"eval_metrics/{name}", value, step_id)
+
+    def _evaluate_agent(
         self,
         agent,
         envs,
@@ -72,16 +119,20 @@ class HabitatMASEvaluator(Evaluator):
             raise FaultInjectionError(
                 "agent_dropout and agent_hang cannot both be enabled"
             )
-        use_hang = hang_spec.enabled or (
-            agent_hang_fault.record_trajectory and not dropout_spec.enabled
-        )
+        use_hang = hang_spec.enabled
         fault_spec = hang_spec if use_hang else dropout_spec
-        fault_config = agent_hang_fault if use_hang else agent_dropout_fault
         fault_name = "agent_hang" if use_hang else "agent_dropout"
+        record_trajectory = config.habitat_baselines.trajectory.enabled
+        output_dir = config.habitat_baselines.output_dir
+        run_label = config.habitat_baselines.run_label
+        detection_spec = ErrorDetectionSpec.from_config(config.habitat_baselines.error_detection)
+        detector = ErrorDetector(detection_spec) if detection_spec.enabled else None
+        if detector is not None and config.habitat_baselines.num_environments != 1:
+            raise ValueError("Error detection currently supports the EMOS single-environment evaluator")
         replay_config = config.habitat_baselines.fault_injection.replay
         replay = CleanPrefixReplay(replay_config.path, atol=replay_config.atol) if replay_config.path else None
         if replay is not None:
-            if (not fault_spec.enabled or not fault_config.record_trajectory
+            if (not fault_spec.enabled or not record_trajectory
                     or config.habitat_baselines.num_environments != 1
                     or config.habitat_baselines.eval.evals_per_ep != 1
                     or getattr(fault_spec, "trigger_domain", "simulator_step") != "simulator_step"):
@@ -99,22 +150,22 @@ class HabitatMASEvaluator(Evaluator):
             AgentHangEventRecorder if use_hang else AgentDropoutEventRecorder
         )
         fault_recorder = (
-            recorder_type(fault_config.output_dir, fault_config.run_label)
+            recorder_type(output_dir, run_label)
             if fault_spec.enabled
             else None
         )
         trajectory_recorder = (
             AgentDropoutTrajectoryRecorder(
-                fault_config.output_dir,
-                fault_config.run_label,
+                output_dir,
+                run_label,
                 mode="faulty" if fault_spec.enabled else "clean",
                 agent_names=config.habitat.simulator.agents.keys(),
                 fault_name=fault_name,
             )
-            if fault_config.record_trajectory
+            if record_trajectory
             else None
         )
-        if trajectory_recorder is not None:
+        if trajectory_recorder is not None or detector is not None:
             envs.call(
                 ["set_task_dynamic_state_capture"] * envs.num_envs,
                 [{"enabled": True} for _ in range(envs.num_envs)],
@@ -212,6 +263,13 @@ class HabitatMASEvaluator(Evaluator):
         ), "You must specify a number of evaluation episodes with test_episode_count"
         envs_text_context = {}
         pbar = tqdm.tqdm(total=number_of_eval_episodes * evals_per_ep)
+        self._crash_context = {
+            "detector": detector, "trajectory_recorder": trajectory_recorder,
+            "fault_recorder": fault_recorder, "pbar": pbar,
+            "report_path": Path(output_dir) / (
+                output_run_stem(run_label, fault_name if fault_spec.enabled else "clean") + "_crash.json"
+            ),
+        }
         agent.eval()
         cur_ep_id = -1
         while (
@@ -242,6 +300,14 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+                    if detector is not None:
+                        ep = current_episodes_info[i]
+                        detector.reset(ep.scene_id, ep.episode_id, config.habitat.simulator.agents.keys())
+                        self._crash_context.update(
+                            completed_steps=0, reward_total=0.0, transition=None,
+                            last_state=envs.call(["get_task_dynamic_state"])[0],
+                            metrics=extract_scalars_from_info(envs.call(["get_info"], [{"observations": None}])[0]),
+                        )
                     if replay is not None:
                         ep = current_episodes_info[i]
                         schedule = fault_spec.simulator_step_schedule_map()
@@ -260,6 +326,7 @@ class HabitatMASEvaluator(Evaluator):
                         )
 
             space_lengths = {}
+            self._crash_context["transition"] = None
             replay_row = replay.prefix_row(simulator_steps[0]) if replay is not None else None
             n_agents = len(config.habitat.simulator.agents)
             if n_agents > 1:
@@ -281,6 +348,7 @@ class HabitatMASEvaluator(Evaluator):
                     trajectory_replay=replay,
                     replay_row=replay_row,
                     record_replay_context=trajectory_recorder is not None,
+                    error_detector=detector,
                     **space_lengths,
                 )
                 if action_data.should_inserts is None:
@@ -328,6 +396,9 @@ class HabitatMASEvaluator(Evaluator):
                     trajectory_recorder.record({**replay.report("replay_failed"), "error": str(error)})
                     raise
 
+            if detector is not None:
+                detector.check_messages(simulator_steps[0], AgentMessageBus.sent_messages,
+                    progress_signature(self._crash_context["last_state"], self._crash_context["metrics"]))
             outputs = envs.step(step_data)
 
             observations, rewards_l, dones, infos = [
@@ -336,6 +407,22 @@ class HabitatMASEvaluator(Evaluator):
             dynamic_state_snapshots = [
                 info.pop("_dynamic_state_snapshot", None) for info in infos
             ]
+            if detector is not None:
+                ep = current_episodes_info[0]
+                self._crash_context.update(
+                    completed_steps=simulator_steps[0] + 1,
+                    reward_total=current_episode_reward[0].item() + rewards_l[0],
+                    last_state=dynamic_state_snapshots[0],
+                    metrics=extract_scalars_from_info(infos[0]),
+                    transition={
+                        "episode_id": ep.episode_id, "scene_id": ep.scene_id,
+                        "simulator_step": simulator_steps[0], "joint_env_action": step_data[0],
+                        "policy_info": None if action_data.policy_info is None else action_data.policy_info[0],
+                        "reward": rewards_l[0], "simulator_state": dynamic_state_snapshots[0],
+                    },
+                )
+                detector.after_step(simulator_steps[0])
+                infos[0].update(detector.metrics())
             # Note that `policy_infos` represents the information about the
             # action BEFORE `observations` (the action used to transition to
             # `observations`).

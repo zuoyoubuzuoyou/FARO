@@ -193,6 +193,8 @@ class ReplayTest(unittest.TestCase):
         _, command, plan = prepare_run(args, [])
         self.assertIn(f'habitat_baselines.fault_injection.replay.path="{self.path}"', command)
         self.assertEqual(plan["replay"]["atol"], 1e-5)
+        with self.assertRaisesRegex(ValueError, "Replay requires trajectory recording"):
+            prepare_run(args, ["habitat_baselines.trajectory.enabled=False"])
         for options in (("--step", "0"), ("--step", "4"), ("--step", "2", "--no-trajectory"),
                         ("--trajectory", str(self.path)), ("--step", "2", "--replay-atol", "nan")):
             with self.subTest(options=options), self.assertRaises(ValueError):

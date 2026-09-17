@@ -159,6 +159,7 @@ class CrabAgent:
             "messages": AgentMessageBus.messages,
             "members": sorted(AgentMessageBus.members),
             "dropped_agents": sorted(AgentMessageBus.dropped_agents),
+            "sent_messages": AgentMessageBus.sent_messages,
         }, default=encode))
 
     def restore_replay_context(self, context: dict) -> None:
@@ -172,6 +173,7 @@ class CrabAgent:
         AgentMessageBus.messages.update(context["messages"])
         AgentMessageBus.members = set(context["members"])
         AgentMessageBus.dropped_agents = set(context["dropped_agents"])
+        AgentMessageBus.sent_messages = context.get("sent_messages", [])
 
     def replay_decision(self, decision: dict) -> None:
         if "replay_context" in decision:

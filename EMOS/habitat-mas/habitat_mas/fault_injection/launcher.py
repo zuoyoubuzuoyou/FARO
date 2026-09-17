@@ -170,7 +170,6 @@ def make_schedule(
 
 def fault_overrides(
     fault: str, agent: str, schedule: dict[str, int],
-    output_dir: Path, run_label: str, record_trajectory: bool,
 ) -> list[str]:
     definition = FAULTS[fault]
     encoded = ";".join(f"{episode}@{step}" for episode, step in schedule.items())
@@ -186,9 +185,6 @@ def fault_overrides(
         f"{prefix}.agent={json.dumps(agent)}",
         f'{prefix}.episode_id=""',
         f"{prefix}.simulator_step_schedule={json.dumps(encoded)}",
-        f"{prefix}.record_trajectory={record_trajectory}",
-        f"{prefix}.output_dir={json.dumps(str(output_dir))}",
-        f"{prefix}.run_label={json.dumps(run_label)}",
     ])
     values.extend(f"{prefix}.{setting}" for setting in definition.overrides)
     return values

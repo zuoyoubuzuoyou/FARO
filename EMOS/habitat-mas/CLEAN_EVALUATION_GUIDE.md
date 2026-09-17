@@ -38,14 +38,41 @@ fault_output/clean_episode20_replay_v3_trace-episode_20.txt
 后续故障命令将 `--replay-trajectory` 指向这个新的 JSONL 即可。
 `--help` 查看完整选项。以下原始入口的用法也继续支持。
 
+clean 也默认启用错误检测器：正常等待不会触发；如果检测到成员掉线、连续
+10 步无响应或无进展的连续重复通信，会保存 `<run_label>_crash.json` 并以
+退出码 3 停止整个评估。错误注入开关和检测开关彼此独立。需要保留原来的
+无监控行为时，追加 `habitat_baselines.error_detection.enabled=False`。
+规则、阈值与报告说明见 [错误检测文档](FAULT_INJECTION_CLI.md#error-detection-system检测并模拟系统崩溃)。
+
+## 公共记录与输出参数
+
+clean、dropout 和 hang 统一使用以下参数：
+
+```text
+habitat_baselines.trajectory.enabled=True
+habitat_baselines.output_dir=fault_output
+habitat_baselines.run_label=clean_random10_seed42
+```
+
+`trajectory.enabled` 控制逐步 JSONL 和 TXT 轨迹；`output_dir` 和 `run_label`
+同时用于轨迹、故障事件和崩溃报告，不改变视频或 LLM 历史的输出位置。
+原始入口默认不记录轨迹，输出目录默认 `fault_output`，空标签按实际运行类型
+使用 `clean`、`dropout` 或 `hang`。两个简写入口默认记录轨迹并生成时间戳标签。
+
+旧的 `fault_injection.structure.agent_dropout/agent_hang` 下的
+`record_trajectory`、`output_dir`、`run_label` 字段已移除，请迁移到上述公共参数。
+故障 `enabled` 默认均为 `False`，默认配置下的 clean 命令无需逐个关闭故障。
+
+```bash
 python -u -m habitat_baselines.run \
   --config-name=multi_rearrange/llm_spot_drone_per.yaml \
   habitat_baselines.evaluate=True \
   habitat_baselines.num_environments=1 \
   habitat_baselines.test_episode_count=1 \
   habitat.environment.iterator_options.shuffle=False \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=clean
+  habitat_baselines.trajectory.enabled=True \
+  habitat_baselines.run_label=clean
+```
 
 ## 1. 随机选择 40 个 episode，记录正常轨迹
 
@@ -56,22 +83,19 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   --config-name=multi_rearrange/llm_spot_drone_per.yaml \
   habitat_baselines.evaluate=True \
   habitat_baselines.num_environments=1 \
-  habitat_baselines.test_episode_count=20 \
-  habitat.environment.iterator_options.num_episode_sample=20 \
+  habitat_baselines.test_episode_count=40 \
+  habitat.environment.iterator_options.num_episode_sample=40 \
   habitat.environment.iterator_options.shuffle=True \
   habitat.environment.iterator_options.group_by_scene=False \
   habitat.seed=42 \
-  habitat_baselines.fault_injection.structure.agent_dropout.enabled=False \
-  habitat_baselines.fault_injection.structure.agent_hang.enabled=False \
-  habitat_baselines.fault_injection.structure.agent_hang.record_trajectory=False \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=clean_random20_seed42
+  habitat_baselines.trajectory.enabled=True \
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=clean_random40_seed42
 ```
 
-这里没有错误注入。两个 `enabled=False` 显式关闭现有错误；
-`agent_dropout.record_trajectory=True` 仅复用轨迹记录器，输出中的 `mode` 为
-`clean`。输出文件以实际运行类型 `clean` 开头，不包含未启用的故障名称。
+这里使用默认关闭的故障配置，没有错误注入。公共的
+`habitat_baselines.trajectory.enabled=True` 开启轨迹记录，输出中的 `mode` 为
+`clean`。输出文件以实际运行类型 `clean` 开头。
 
 相对于原来的单 episode 命令，随机抽取 40 个的关键设置如下：
 
@@ -189,7 +213,7 @@ ID 的后一次运行可能覆盖前一次文件，应以完整 JSONL 为准。
 | 关闭视频以减少录制和磁盘开销 | `habitat_baselines.eval.video_option=[]` |
 | 修改视频目录 | `habitat_baselines.video_dir=video_multi/clean_random40_seed42` |
 | 修改 TensorBoard 目录 | `habitat_baselines.tensorboard_dir=tb/clean_random40_seed42` |
-| 不保存逐步 JSONL | `habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=False` |
+| 不保存逐步 JSONL | `habitat_baselines.trajectory.enabled=False` |
 | 更换源数据集 | `habitat.dataset.data_path=<数据集路径>` |
 
 本指南命令已按当前代码中的参数和 iterator 抽样行为核对；未启动 40 个 episode

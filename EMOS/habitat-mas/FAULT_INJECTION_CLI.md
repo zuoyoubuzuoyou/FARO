@@ -6,6 +6,29 @@
 在项目根目录使用 `python scripts/inject_fault.py`，原来的 `--config-name` 和
 Hydra `key=value` 参数可以继续直接传入，不需要额外的 `--` 分隔符。
 
+## 公共记录与输出参数
+
+clean、dropout、hang 使用同一组配置，原始入口与简写脚本均可传入：
+
+```text
+habitat_baselines.trajectory.enabled=True
+habitat_baselines.output_dir=fault_output
+habitat_baselines.run_label=my_run
+```
+
+轨迹开关只控制逐步 JSONL/TXT，关闭后故障事件和检测到的崩溃报告仍会输出。
+公共目录和标签用于这三类输出，视频和 LLM 历史继续使用原有专用路径。
+原始入口的轨迹开关默认 `False`，目录默认 `fault_output`，标签默认空字符串，
+按实际运行类型命名为 `clean`、`dropout` 或 `hang`。
+
+简写脚本默认开启记录并生成时间戳标签；`--no-trajectory`、`--output-dir`、
+`--run-label` 分别是公共开关设为 `False`、输出目录、标签的别名。也可直接传入
+上述 Hydra 参数；两种写法同时出现且值不同会报错。输出参数会规范化为计划中的
+路径与值，保证打印的路径与实际输出一致。
+
+故障配置中原有的 `record_trajectory`、`output_dir`、`run_label` 字段已移除，
+旧命令需迁移到公共参数。故障 `enabled`、agent 和触发步等设置保持原有位置。
+
 ## 指定 episode 和注入步数
 
 ```bash
@@ -56,8 +79,8 @@ python scripts/inject_fault.py \
 位置、奖励、done 以及记录中的任务指标。任何偏差都会立即停止，不能继续作为有效对照。
 数值比较使用绝对容差 `--replay-atol`，默认 `0.00001`；设置为 `0` 要求记录值精确相等。
 
-第 T 步起停止读取 clean 的动作与决策，按现有故障机制和实时观测正常执行。
-回放本身不增加自动接管机制：例如原先等待的 Spot 是否中断等待，由已有策略决定。
+第 T 步起停止读取 clean 的动作与决策，进入故障运行。默认开启下面的错误检测器：
+dropout 当步终止；hang 达到连续无响应阈值后终止。回放本身不增加自动接管机制。
 
 新录制的轨迹在高层决策中保存 `replay_context`，包含任务分配、模型对话历史和
 通信队列，回放时恢复这些上下文。**旧日志没有这些信息时，仅能用已记录的决策
@@ -76,6 +99,67 @@ JSONL 额外包含以下事件（TXT 继续记录实际执行轨迹）：
 `--dry-run` 可先检查源日志、目标 episode 和步数并生成计划，不运行模型或仿真。
 离线检查通过不表示实际物理轨迹已经匹配；运行时的 `replay_prefix_verified`
 才表示前缀通过校验。回放不支持 `--no-trajectory`，以保留校验结果和后续轨迹。
+
+## Error detection system：检测并模拟系统崩溃
+
+`HabitatMASEvaluator` 默认启用独立于 LLM 决策的检测器，每个仿真步检查团队状态。
+检测触发时抛出 `DetectedSystemCrash`，由评估器的 `except` 捕捉、保存崩溃结果、
+关闭所有 agent 所在的环境，并以 **退出码 3** 结束本次评估。不会继续下一步或
+后续 episode，也不会等待正在执行 `Wait[500]` 的队友再次调用 LLM。
+这是明确的模拟崩溃结果，不是 Python 意外报错或等待到环境步数上限。
+
+| 检测规则 | 默认阈值 | 终止位置 |
+| --- | --- | --- |
+| 有 agent 不在线（dropout） | 立即 | 当前步所有 agent 的策略、LLM 和环境动作执行前 |
+| 有 agent 连续无响应（hang） | 10 个已执行的仿真步 | 第 10 个无响应步结束后 |
+| 同一发送者连续发送相同内容给同一接收者，期间没有物理/任务进展 | 10 条实际发送的消息 | 当前步环境动作执行前 |
+
+所有步号从 0 开始。注入点为 40 时，dropout 只执行第 0～39 步，
+`detected_step=40`、`completed_steps=40`；hang 执行第 40～49 步共 10 个
+无响应步后终止，`detected_step=49`、`completed_steps=50`。
+hang 阈值改为 20 时，在第 59 步结束后终止，共执行 60 步。
+
+使用你已记录的 clean 轨迹运行 hang 检测：
+
+```bash
+env -u ALL_PROXY -u all_proxy python scripts/inject_fault.py \
+  --fault hang --agent agent_1 --episode 20 --step 40 \
+  --replay-trajectory fault_output/clean_20260914_004649_044798_trajectory.jsonl \
+  habitat_baselines.evaluate=True \
+  habitat_baselines.num_environments=1 \
+  habitat_baselines.test_episode_count=1 \
+  habitat.environment.iterator_options.shuffle=False \
+  habitat_baselines.error_detection.hang_steps=10
+```
+
+将 `--fault hang` 改为 `--fault dropout` 即运行掉线检测。默认生成新的时间戳标签；
+也可以用 `--run-label` 指定未使用的名字。以下 Hydra 参数适用于注入入口、clean
+入口和原始 `python -m habitat_baselines.run` 入口：
+
+```text
+habitat_baselines.error_detection.enabled=True
+habitat_baselines.error_detection.hang_steps=20
+habitat_baselines.error_detection.repeated_message_limit=10
+```
+
+设 `habitat_baselines.error_detection.enabled=False` 可以对照原来的“注入后继续
+运行直到任务结束/超时”的行为。当前检测器只支持单环境评估。
+
+检测过程和结果会记录 `error_detection.all_agents_online`、
+`error_detection.all_agents_responsive`、`error_detection.no_message_loop`、
+`error_detection.max_unresponsive_steps`、`error_detection.system_crash` 等指标。
+崩溃时任务成功指标 `pddl_success=0`，`system_crash=1`。额外生成
+`fault_output/<run_label>_crash.json`，包含原因、agent 状态、检测步、实际完成步数、
+连续异常计数、检测阶段、最终状态和指标。JSONL 添加 `type=system_crash` 的终止
+事件，TXT 添加 `System_Crash`。即使 `--no-trajectory`，崩溃报告也会保存。
+动作执行前终止时不伪造当前步的 `simulator_step` 记录，应读取 `system_crash`
+事件判断终止；动作执行后终止时最后一个实际步标记 `done=True`。
+
+实现范围：hang 的无响应状态来自模拟运行时的挂起标记，检测器累计该状态，
+不会仅凭位置不变、普通 `Wait` 或反复打印同一个导航动作判定 hang。
+通信循环目前做空白归一化后的精确匹配，不调用 LLM 判断语义近似，也不覆盖
+措辞变化的消息循环。它是随仿真步执行的监控代码，不是独立进程的墙钟超时器，
+不能打断 Python/原生仿真/API 调用本身彻底卡死的情况。
 
 ## 随机选择 episode 和注入步数
 
@@ -141,6 +225,7 @@ Dropout 命令中加 `--run-label dropout_episode28_step40`，运行后得到：
 fault_output/dropout_episode28_step40_trajectory.jsonl
 fault_output/dropout_episode28_step40_trace-episode_28.txt
 fault_output/dropout_episode28_step40_events.jsonl
+fault_output/dropout_episode28_step40_crash.json  # 仅检测到崩溃时生成
 ```
 
 JSONL 每个仿真步包含动作、agent 和对象状态、奖励、结束标记等；TXT 每步包含
@@ -182,8 +267,10 @@ python scripts/inject_fault.py \
 
 新错误实现对应配置与运行时处理后，在 `habitat_mas/fault_injection/launcher.py`
 的 `FAULTS` 注册配置路径、校验类、别名及额外配置。公共参数为 `enabled`、
-`agent`、`episode_id`、`simulator_step_schedule`、`record_trajectory`、`output_dir`、
-`run_label`。数据选择、抽样和计划保存无需为每个错误重复实现。
+`agent`、`episode_id`、`simulator_step_schedule`。轨迹开关及输出参数来自
+`habitat_baselines.trajectory.enabled`、`habitat_baselines.output_dir` 和
+`habitat_baselines.run_label`，新增故障无需单独定义。数据选择、抽样和计划保存
+无需为每个错误重复实现。
 
 ```bash
 PYTHONPATH=habitat-mas python -m unittest \

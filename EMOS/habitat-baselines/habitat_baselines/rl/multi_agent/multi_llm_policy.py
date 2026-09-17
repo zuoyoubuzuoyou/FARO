@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from habitat_mas.agents.actions.discussion_actions import *
 from habitat_mas.agents.message_bus import AgentMessageBus
+from habitat_mas.error_detection import DetectedSystemCrash
 from habitat_mas.fault_injection.agent_dropout import (
     AgentDropoutFaultSpec,
     FaultInjectionError,
@@ -617,6 +618,8 @@ class MultiLLMPolicy(MultiPolicy):
             simulator_steps = [0 for _ in range(n_envs)]
         replay = kwargs.get("trajectory_replay")
         replay_row = kwargs.get("replay_row")
+        error_detector = kwargs.get("error_detector")
+        AgentMessageBus.sent_messages.clear()
 
         text_goal = observations["pddl_text_goal"][0].tolist()
         text_goal = "".join([chr(code) for code in text_goal]).strip()
@@ -654,10 +657,12 @@ class MultiLLMPolicy(MultiPolicy):
                 # print(text_goal)
                 # print("=============================================")
                 
-                agent_arguments = {} if replay is not None else group_discussion(
-                    robot_resume, 
-                    scene_description, 
-                    text_goal, 
+                # Defer planning until the watchdog has checked membership,
+                # including faults injected at the very first simulator step.
+                agent_arguments = {} if replay is not None else dict(
+                    robot_resume=robot_resume,
+                    scene_description=scene_description,
+                    task_description=text_goal,
                     should_group_discussion=self.should_group_discussion, 
                     should_agent_reflection=self.should_agent_reflection,
                     should_robot_resume=self.should_robot_resume, 
@@ -747,6 +752,27 @@ class MultiLLMPolicy(MultiPolicy):
                 dropout_active, dropout_events, active_dropout_events,
                 agent_decision_steps, hang_events, active_hang_events,
             ))
+
+        # An external watchdog may stop the whole team BEFORE any individual
+        # policy or LLM executes at this step. Status, not the schedule, is input.
+        if error_detector is not None:
+            online_members = set(AgentMessageBus.active_members())
+            health = {
+                f"agent_{i}": {
+                    "online": f"agent_{i}" in online_members,
+                    "responsive": f"agent_{i}" in online_members and state[5][0] is None,
+                }
+                for i, state in enumerate(agent_fault_states)
+            }
+            try:
+                error_detector.before_actions(int(simulator_steps[0]), health)
+            except DetectedSystemCrash as error:
+                error.fault_events = [event for state in agent_fault_states
+                                      for event in (state[1][0], state[4][0]) if event is not None]
+                raise
+
+        if replay is None:
+            envs_agent_arguments = [group_discussion(**arguments) for arguments in envs_agent_arguments]
 
         # Stage 2: Individual policy actions
         agent_actions = []

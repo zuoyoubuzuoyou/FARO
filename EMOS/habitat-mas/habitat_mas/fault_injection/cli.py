@@ -27,6 +27,11 @@ from habitat_mas.fault_injection.replay import CleanPrefixReplay
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = "multi_rearrange/llm_spot_drone_per.yaml"
+OUTPUT_KEYS = (
+    "habitat_baselines.trajectory.enabled",
+    "habitat_baselines.output_dir",
+    "habitat_baselines.run_label",
+)
 
 
 def build_parser(*, clean: bool = False) -> argparse.ArgumentParser:
@@ -63,8 +68,8 @@ def build_parser(*, clean: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, help="Override the config's episode JSON/JSON.gz")
     parser.add_argument("--max-episode-steps", type=int,
                         help="Override the environment step limit (also enables offline dry-run with --dataset)")
-    parser.add_argument("--output-dir", type=Path, default=Path("fault_output"),
-                        help="Directory for trajectory JSONL and episode TXT files, like clean runs")
+    parser.add_argument("--output-dir", type=Path,
+                        help="Shared trajectory/event/crash directory (default: fault_output)")
     parser.add_argument("--run-label", help="Output filename label and plan subdirectory; default: run type + timestamp")
     parser.add_argument("--no-trajectory", action="store_true", help="Disable trajectory recording" if clean else "Only record fault events")
     parser.add_argument("--dry-run", action="store_true", help="Write subset/plan and print command without evaluating")
@@ -99,6 +104,8 @@ def validate_overrides(overrides: list[str]) -> None:
             raise ValueError(f"Expected a Hydra key=value override, got {override!r}")
         if key == prefix or key.startswith(prefix + ".") or prefix.startswith(key + "."):
             raise ValueError(f"{key} conflicts with the short fault-injection options")
+        if key == "habitat_baselines.trajectory" or (override.startswith("~") and key in OUTPUT_KEYS):
+            raise ValueError(f"Set {OUTPUT_KEYS[0]}, output_dir and run_label individually; cannot replace/delete {key}")
 
 
 def effective_overrides(args, overrides: list[str]) -> list[str]:
@@ -108,19 +115,37 @@ def effective_overrides(args, overrides: list[str]) -> list[str]:
     aliases = {
         "habitat.dataset.data_path": None if args.dataset is None else str(args.dataset.resolve()),
         "habitat.environment.max_episode_steps": args.max_episode_steps,
+        "habitat_baselines.output_dir": None if args.output_dir is None else str(args.output_dir.resolve()),
+        "habitat_baselines.run_label": args.run_label,
+        "habitat_baselines.trajectory.enabled": False if args.no_trajectory else None,
     }
     for key, value in aliases.items():
         if value is None:
             continue
         if key in existing:
             actual = scalar_value(existing[key])
-            if key.endswith("data_path"):
+            if key in ("habitat.dataset.data_path", "habitat_baselines.output_dir"):
                 actual = str(Path(actual).resolve())
             if actual != value:
                 raise ValueError(f"Conflicting values for {key}; use its EMOS argument or the short alias")
         else:
             result.append(f"{key}={json.dumps(value)}")
     return result
+
+
+def output_settings(overrides: list[str]) -> tuple[bool, Path, str]:
+    """Read shared output options before planning or writing any files."""
+    values = override_values(overrides)
+    enabled = scalar_value(values[OUTPUT_KEYS[0]])
+    directory = scalar_value(values[OUTPUT_KEYS[1]])
+    label = scalar_value(values[OUTPUT_KEYS[2]])
+    if type(enabled) is not bool:
+        raise ValueError(f"{OUTPUT_KEYS[0]} must be True or False")
+    if not isinstance(directory, str) or not directory:
+        raise ValueError(f"{OUTPUT_KEYS[1]} must be a nonempty directory path")
+    if not isinstance(label, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", label) is None:
+        raise ValueError("--run-label / habitat_baselines.run_label must begin with a letter/digit and use only letters, digits, _, -, .")
+    return enabled, Path(directory).resolve(), label
 
 
 EVAL_KEYS = {
@@ -200,6 +225,16 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
     validate_overrides(overrides)
     original_overrides = list(overrides)
     overrides = effective_overrides(args, overrides)
+    # Both convenience entry points record by default; explicit common options
+    # or their short aliases take precedence over these launcher defaults.
+    existing = override_values(overrides)
+    output_defaults = {
+        OUTPUT_KEYS[0]: True,
+        OUTPUT_KEYS[1]: "fault_output",
+        OUTPUT_KEYS[2]: output_run_stem(datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"), args.fault),
+    }
+    overrides += [f"{key}={json.dumps(value)}" for key, value in output_defaults.items() if key not in existing]
+    record_trajectory, output_dir, label = output_settings(overrides)
     if args.clean:
         # The clean convenience entry point supplies evaluation defaults only
         # when the caller has not explicitly provided that setting.
@@ -217,14 +252,9 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
         raise ValueError("Specify --step, or --trajectory CLEAN.jsonl to sample real episode steps")
     if args.replay_trajectory and (args.step is None or args.trajectory is not None):
         raise ValueError("--replay-trajectory requires --step; --trajectory only samples steps")
-    if args.replay_trajectory and args.no_trajectory:
-        raise ValueError("Replay requires trajectory recording; remove --no-trajectory")
+    if args.replay_trajectory and not record_trajectory:
+        raise ValueError("Replay requires trajectory recording; remove --no-trajectory and set habitat_baselines.trajectory.enabled=True")
     replay = CleanPrefixReplay(args.replay_trajectory, atol=args.replay_atol) if args.replay_trajectory else None
-    label = args.run_label or (
-        output_run_stem(datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"), args.fault)
-    )
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", label) is None:
-        raise ValueError("--run-label must begin with a letter/digit and use only letters, digits, _, -, .")
     dataset_path, max_steps, scenes, agents, config_checked, eval_settings = resolve_environment(args, overrides)
     if not args.clean and agents is not None and args.agent not in agents:
         raise ValueError(f"Unknown agent {args.agent!r}; configured agents: {', '.join(agents)}")
@@ -249,7 +279,6 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
     if replay is not None:
         for ep in selected:
             replay.validate_episode(ep["scene_id"], ep["episode_id"], schedule[str(ep["episode_id"])])
-    output_dir = args.output_dir.resolve()
     run_dir = output_dir / label
     stem = output_run_stem(label, args.fault)
     trace_episode_ids = [
@@ -257,39 +286,38 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
         for ep in selected
     ]
     outputs = {
+        "crash_report": str(output_dir / f"{stem}_crash.json"),
         "events": None if args.clean else str(output_dir / f"{stem}_events.jsonl"),
-        "trajectory": None if args.no_trajectory else str(output_dir / f"{stem}_trajectory.jsonl"),
-        "traces": [] if args.no_trajectory else [
+        "trajectory": str(output_dir / f"{stem}_trajectory.jsonl") if record_trajectory else None,
+        "traces": [
             str(output_dir / f"{stem}_trace-episode_{episode_id}.txt")
             for episode_id in trace_episode_ids
-        ],
+        ] if record_trajectory else [],
     }
-    for path in [outputs["events"], outputs["trajectory"], *outputs["traces"]]:
+    for path in [outputs["events"], outputs["trajectory"], outputs["crash_report"], *outputs["traces"]]:
         if path is not None and Path(path).exists():
             raise FileExistsError(f"Output already exists: {path}; choose another --run-label")
     subset_path = run_dir / "episodes.json.gz"
     command = [sys.executable, "-u", "-m", "habitat_baselines.run", f"--config-name={args.config}"]
     # The original data_path identifies the source dataset. Execution uses its
-    # selected subset; all remaining EMOS arguments pass through verbatim.
+    # selected subset. Shared output arguments are normalized to match the plan;
+    # all remaining EMOS arguments pass through verbatim.
     command += [
         item for item in overrides
-        if item.partition("=")[0].lstrip("+~") != "habitat.dataset.data_path"
+        if item.partition("=")[0].lstrip("+~") not in ("habitat.dataset.data_path", *OUTPUT_KEYS)
     ]
     command.append(f"habitat.dataset.data_path={json.dumps(str(subset_path))}")
+    command += [
+        f"habitat_baselines.trajectory.enabled={record_trajectory}",
+        f"habitat_baselines.output_dir={json.dumps(str(output_dir))}",
+        f"habitat_baselines.run_label={json.dumps(label)}",
+    ]
     if args.clean:
         for definition in FAULTS.values():
             command += [f"{definition.config_path}.enabled=False"]
-            if definition.config_path != FAULTS["agent_dropout"].config_path:
-                command += [f"{definition.config_path}.record_trajectory=False"]
-        prefix = FAULTS["agent_dropout"].config_path
-        command += [
-            f"{prefix}.record_trajectory={not args.no_trajectory}",
-            f"{prefix}.output_dir={json.dumps(str(output_dir))}",
-            f"{prefix}.run_label={json.dumps(label)}",
-            'habitat_baselines.fault_injection.replay.path=""',
-        ]
+        command.append('habitat_baselines.fault_injection.replay.path=""')
     else:
-        command += fault_overrides(args.fault, args.agent, schedule, output_dir, label, not args.no_trajectory)
+        command += fault_overrides(args.fault, args.agent, schedule)
     if replay is not None:
         command += [
             f"habitat_baselines.fault_injection.replay.path={json.dumps(replay.path)}",
@@ -337,6 +365,7 @@ def main(argv: list[str] | None = None, *, clean: bool = False) -> int:
         step_text = "" if clean else f" step={episode['simulator_step']}"
         print(f"  episode={episode['episode_id']}{step_text} scene={episode['scene_id']}")
     print(f"Plan: {plan_path}")
+    print(f"Crash report (if detected): {plan['outputs']['crash_report']}")
     if plan["replay"] is not None:
         print(f"Replay clean prefix: {plan['replay']['path']} (atol={plan['replay']['atol']}); abort on divergence")
     if plan["outputs"]["events"] is not None:

@@ -78,8 +78,8 @@ class FaultLauncherTest(unittest.TestCase):
                 args = self.args("--fault", fault, "--episode", "2", "--step", "0",
                                  "--run-label", f"agent_{fault}_comparison")
                 plan_path, command, plan = prepare_run(args, [])
-                prefix = f"habitat_baselines.fault_injection.structure.agent_{fault}"
-                values = dict(arg.split("=", 1) for arg in command if arg.startswith(prefix))
+                prefix = "habitat_baselines"
+                values = dict(arg.split("=", 1) for arg in command if arg.startswith(prefix) and "=" in arg)
                 recorder = AgentDropoutTrajectoryRecorder(
                     json.loads(values[f"{prefix}.output_dir"]),
                     json.loads(values[f"{prefix}.run_label"]), "faulty",
@@ -116,7 +116,7 @@ class FaultLauncherTest(unittest.TestCase):
         _, command, plan = prepare_run(self.args("--episode", "1", "--step", "0", "--no-trajectory"), [])
         self.assertIsNone(plan["outputs"]["trajectory"])
         self.assertEqual(plan["outputs"]["traces"], [])
-        self.assertIn("habitat_baselines.fault_injection.structure.agent_hang.record_trajectory=False", command)
+        self.assertIn("habitat_baselines.trajectory.enabled=False", command)
 
     def test_random_plans_reproduce_and_follow_each_clean_length(self):
         results = []
@@ -183,11 +183,57 @@ class FaultLauncherTest(unittest.TestCase):
             make_schedule([episode(9)], seed=0, max_episode_steps=10, trace_steps=read_trace_steps(self.trace))
 
     def test_dropout_configuration_and_safe_string_arguments(self):
-        args = fault_overrides("agent_dropout", "agent_1", {"15": 4, "28": 6}, self.root / "space path", "test", True)
+        args = fault_overrides("agent_dropout", "agent_1", {"15": 4, "28": 6})
         self.assertIn("habitat_baselines.fault_injection.structure.agent_dropout.trigger_domain=simulator_step", args)
         self.assertIn('habitat_baselines.fault_injection.structure.agent_dropout.simulator_step_schedule="15@4;28@6"', args)
-        output_arg = next(arg for arg in args if ".output_dir=" in arg)
+        _, command, _ = prepare_run(self.args("--episode", "1", "--step", "0",
+                                   "--output-dir", str(self.root / "space path")), [])
+        output_arg = next(arg for arg in command if arg.startswith("habitat_baselines.output_dir="))
         self.assertEqual(json.loads(output_arg.split("=", 1)[1]), str(self.root / "space path"))
+
+    def test_common_output_options_apply_to_clean_dropout_and_hang(self):
+        for mode in ("clean", "dropout", "hang"):
+            for enabled in (True, False):
+                with self.subTest(mode=mode, enabled=enabled):
+                    options = ["--episode", "2", "--dry-run", "--dataset", str(self.dataset),
+                               "--max-episode-steps", "10"]
+                    if mode != "clean":
+                        options += ["--fault", mode, "--step", "0"]
+                    args = build_parser(clean=mode == "clean").parse_args(options)
+                    label = f"{mode}_recording_{enabled}"
+                    directory = self.root / "shared outputs"
+                    overrides = [f"habitat_baselines.trajectory.enabled={enabled}",
+                                 f'habitat_baselines.output_dir="{directory}"',
+                                 f'habitat_baselines.run_label="{label}"']
+                    path, command, plan = prepare_run(args, overrides)
+                    self.assertEqual(path.parent, directory / label)
+                    self.assertEqual(plan["emos_overrides"], overrides)
+                    for override in overrides:
+                        self.assertEqual(command.count(override), 1)
+                    self.assertEqual(plan["outputs"]["crash_report"], str(directory / f"{label}_crash.json"))
+                    self.assertEqual(plan["outputs"]["events"], None if mode == "clean" else str(directory / f"{label}_events.jsonl"))
+                    self.assertEqual(plan["outputs"]["trajectory"], str(directory / f"{label}_trajectory.jsonl") if enabled else None)
+                    self.assertEqual(bool(plan["outputs"]["traces"]), enabled)
+
+    def test_conflicting_output_aliases_fail_before_writing(self):
+        cases = [
+            (("--no-trajectory",), "habitat_baselines.trajectory.enabled=True"),
+            (("--run-label", "first"), "habitat_baselines.run_label=second"),
+            ((), f"habitat_baselines.output_dir={self.root / 'other'}"),
+        ]
+        for options, override in cases:
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "Conflicting values"):
+                prepare_run(self.args("--episode", "1", "--step", "0", *options), [override])
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_invalid_common_output_options_fail_before_writing(self):
+        for override in ("habitat_baselines.trajectory.enabled=invalid",
+                         'habitat_baselines.run_label="../escape"',
+                         "habitat_baselines.trajectory={}",
+                         "~habitat_baselines.output_dir"):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                prepare_run(self.args("--episode", "1", "--step", "0"), [override])
+        self.assertFalse((self.root / "runs").exists())
 
     def test_reserved_overrides_cannot_invalidate_plan(self):
         for override in (

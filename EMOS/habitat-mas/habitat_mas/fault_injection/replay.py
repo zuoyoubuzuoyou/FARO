@@ -191,6 +191,6 @@ class CleanPrefixReplay:
         compare_recorded(row["reward"], reward, path=f"step {step}.reward", atol=self.atol)
         # Policy diagnostic keys may change with recording versions. Task metrics
         # must still match, including detection history and collision counters.
-        task_metrics = {k: v for k, v in row["metrics"].items() if not k.startswith("agent_")}
+        task_metrics = {k: v for k, v in row["metrics"].items() if not k.startswith(("agent_", "error_detection."))}
         compare_recorded(task_metrics, metrics, path=f"step {step}.metrics", atol=self.atol)
         self.verified_steps += 1

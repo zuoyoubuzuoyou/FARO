@@ -45,9 +45,9 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   habitat_baselines.test_episode_count=1 \
   habitat.environment.iterator_options.shuffle=False \
   habitat_baselines.fault_injection.structure.agent_dropout.enabled=False \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=clean
+  habitat_baselines.trajectory.enabled=True \
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=clean
 ```
 
 ## Faulty run: simulator-step trigger
@@ -63,13 +63,13 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   habitat_baselines.test_episode_count=1 \
   habitat.environment.iterator_options.shuffle=False \
   habitat_baselines.fault_injection.structure.agent_dropout.enabled=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
+  habitat_baselines.trajectory.enabled=True \
   habitat_baselines.fault_injection.structure.agent_dropout.episode_id=15 \
   habitat_baselines.fault_injection.structure.agent_dropout.agent=agent_1 \
   habitat_baselines.fault_injection.structure.agent_dropout.trigger_domain=simulator_step \
   habitat_baselines.fault_injection.structure.agent_dropout.simulator_step=40 \
-  habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=dropout_sim_step
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=dropout_sim_step
 ```
 
 This can interrupt an already-running Navigate/Pick/Place skill. The event also
@@ -110,12 +110,12 @@ env \
   habitat.environment.iterator_options.shuffle=True \
   habitat_baselines.eval.video_option=[] \
   habitat_baselines.fault_injection.structure.agent_dropout.enabled=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
+  habitat_baselines.trajectory.enabled=True \
   habitat_baselines.fault_injection.structure.agent_dropout.agent=agent_1 \
   habitat_baselines.fault_injection.structure.agent_dropout.trigger_domain=simulator_step \
   'habitat_baselines.fault_injection.structure.agent_dropout.simulator_step_schedule="233@18;27@40;49@24;96@0;77@2;279@37;28@6;354@35;126@23;178@2"' \
-  habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=dropout_sim_random10
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=dropout_sim_random10
 ```
 
 ## Faulty run: high-level-decision trigger
@@ -142,13 +142,13 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   habitat_baselines.test_episode_count=1 \
   habitat.environment.iterator_options.shuffle=False \
   habitat_baselines.fault_injection.structure.agent_dropout.enabled=True \
-  habitat_baselines.fault_injection.structure.agent_dropout.record_trajectory=True \
+  habitat_baselines.trajectory.enabled=True \
   habitat_baselines.fault_injection.structure.agent_dropout.episode_id=15 \
   habitat_baselines.fault_injection.structure.agent_dropout.agent=agent_1 \
   habitat_baselines.fault_injection.structure.agent_dropout.trigger_domain=high_level_decision \
   habitat_baselines.fault_injection.structure.agent_dropout.decision_step=2 \
-  habitat_baselines.fault_injection.structure.agent_dropout.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_dropout.run_label=dropout_decision_step
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=dropout_decision_step
 ```
 
 The outputs are:

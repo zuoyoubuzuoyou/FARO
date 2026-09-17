@@ -38,9 +38,9 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
   habitat_baselines.fault_injection.structure.agent_hang.enabled=True \
   habitat_baselines.fault_injection.structure.agent_hang.agent=agent_1 \
   habitat_baselines.fault_injection.structure.agent_hang.simulator_step=40 \
-  habitat_baselines.fault_injection.structure.agent_hang.record_trajectory=True \
-  habitat_baselines.fault_injection.structure.agent_hang.output_dir=fault_output \
-  habitat_baselines.fault_injection.structure.agent_hang.run_label=hang_faulty
+  habitat_baselines.trajectory.enabled=True \
+  habitat_baselines.output_dir=fault_output \
+  habitat_baselines.run_label=hang_faulty
 ```
 
 步数从 0 开始：目标 agent 正常执行 0–39 步，第 40 步动作之前开始挂起，
@@ -71,8 +71,9 @@ env -u ALL_PROXY -u all_proxy python -u -m habitat_baselines.run \
 未触发任何配置故障、调度中的 episode 未触发、目标 agent 不存在或配置非法
 都会报错。若 episode 在触发步之前结束，不会伪造注入事件。
 
-对照运行将 `enabled=False`，保留 `record_trajectory=True` 并改用不同的
-`run_label`。同名输出文件会被覆盖。
+对照运行将故障的 `enabled=False`，保留公共的
+`habitat_baselines.trajectory.enabled=True` 并改用不同的
+`habitat_baselines.run_label`。同名输出文件会被覆盖。
 
 无需 Habitat/PyTorch 的测试命令：
 

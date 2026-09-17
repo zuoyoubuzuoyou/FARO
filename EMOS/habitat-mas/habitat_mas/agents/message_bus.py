@@ -7,12 +7,14 @@ class AgentMessageBus:
     messages: dict[str, list[str]] = {}
     members: set[str] = set()
     dropped_agents: set[str] = set()
+    sent_messages: list[dict[str, str]] = []
 
     @classmethod
     def reset(cls) -> None:
         cls.messages.clear()
         cls.members.clear()
         cls.dropped_agents.clear()
+        cls.sent_messages.clear()
 
     @classmethod
     def active_members(cls) -> list[str]:
@@ -40,6 +42,7 @@ class AgentMessageBus:
         cls.messages.setdefault(target, []).append(
             f'"{source}" agent sent you requests: "{request}".'
         )
+        cls.sent_messages.append({"source": source, "target": target, "request": request})
         return None
 
     @classmethod
