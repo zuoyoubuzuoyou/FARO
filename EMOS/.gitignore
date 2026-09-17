@@ -108,4 +108,5 @@ debug/
 # Local experiment outputs and backups
 episode_log/
 /fault_output/
+/clean_output/
 *.bak
