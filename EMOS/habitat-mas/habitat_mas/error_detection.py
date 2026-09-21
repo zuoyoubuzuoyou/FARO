@@ -7,6 +7,7 @@ not read injection schedules or ask the task LLM whether evaluation should stop.
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -53,6 +54,20 @@ class ErrorDetector:
         self.last_progress = None
         self.last_step = -1
         self.crash = None
+        self.recovered_dropouts = set()
+
+    def acknowledge_dropout(self, names):
+        """Clear only a dropout latch after its task transfer and replans succeed."""
+        names = set(names)
+        if (self.crash is None or self.crash.event["reason"] != "agent_dropout"
+                or self.crash.event["agent"] not in names
+                or any(name not in self.health or self.health[name]["online"] for name in names)):
+            raise ValueError("Only the currently detected offline agents can be acknowledged")
+        self.recovered_dropouts.update(names)
+        for name in names:
+            self.unresponsive[name] = 0
+            self.message_runs.pop(name, None)
+        self.crash = None
 
     def _check_latch(self):
         if self.crash is not None:
@@ -63,7 +78,7 @@ class ErrorDetector:
             "type": "system_crash", "scene_id": self.scene_id, "episode_id": self.episode_id,
             "reason": reason, "agent": name, "simulator_step": step, "phase": phase,
             "consecutive_count": count, "evidence": evidence,
-            "agent_status": self.health, "simulated_crash": True,
+            "agent_status": copy.deepcopy(self.health), "simulated_crash": True,
         }
         self.crash = DetectedSystemCrash(event)
         raise self.crash
@@ -76,7 +91,7 @@ class ErrorDetector:
             raise ValueError("Error detector requires status for every configured agent")
         self.health = health
         for name in self.names:
-            if not health[name]["online"]:
+            if not health[name]["online"] and name not in self.recovered_dropouts:
                 self._fail("agent_dropout", name, step, "PRE_ACTION", 1,
                            "Agent is no longer an online team member")
 
@@ -108,6 +123,8 @@ class ErrorDetector:
             raise ValueError(f"Watchdog expected completed step {self.last_step + 1}, got {step}")
         self.last_step = step
         for name in self.names:
+            if name in self.recovered_dropouts and not self.health[name]["online"]:
+                continue
             count = self.unresponsive[name] + 1 if not self.health[name]["responsive"] else 0
             self.unresponsive[name] = count
             if count >= self.spec.hang_steps:

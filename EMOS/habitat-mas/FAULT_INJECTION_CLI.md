@@ -80,7 +80,63 @@ python scripts/inject_fault.py \
 数值比较使用绝对容差 `--replay-atol`，默认 `0.00001`；设置为 `0` 要求记录值精确相等。
 
 第 T 步起停止读取 clean 的动作与决策，进入故障运行。默认开启下面的错误检测器：
-dropout 当步终止；hang 达到连续无响应阈值后终止。回放本身不增加自动接管机制。
+dropout 默认当步终止；hang 达到连续无响应阈值后终止。可开启下面的最小 dropout
+recovery，在回放前缀结束后接管未完成任务。
+
+## 最小 dropout recovery
+
+追加 `habitat_baselines.error_recovery.enabled=True` 启用：
+
+```bash
+conda activate habitat
+python scripts/inject_fault.py \
+  --fault dropout --agent agent_1 --episode 295 --step 20 \
+  --run-label recovery_dropout_episode295_step20 \
+  habitat_baselines.evaluate=True \
+  habitat_baselines.num_environments=1 \
+  habitat_baselines.test_episode_count=1 \
+  habitat.environment.iterator_options.shuffle=False \
+  habitat_baselines.error_recovery.enabled=True
+```
+
+执行链路是 **dropout → 检测成员掉线 → 读取当前 PDDL 目标真值 → 筛选未完成任务
+→ 分配给存活 agent → 更新规划 → 当步继续执行**。第 0 步掉线也支持，直接为
+存活团队分配尚未完成的目标。关闭 recovery 时保留原来的检测后终止行为。
+recovery 要求 `error_detection.enabled=True`，当前仅支持单环境。
+
+首版使用确定性基线：按初始分工里的精确实体名关联目标，保留存活 agent 的任务，
+把掉线 agent 遗留任务分给任务数最少的存活 agent，同任务数按 agent 名排序。
+分工缺失或归属含糊的目标会明确标为 `unassigned_tasks`，再参与分配。
+当前已满足的目标不作为新的接管任务；它们仍是必须保持的条件，负责维持这些条件
+的 agent 也计入负载。若移动使条件失效，重规划提示要求重新满足它们。这里读取的是
+目标当前真值，不以 `wait`、导航完成或历史阶段指标代替目标完成判定。
+
+接管保留当前物理状态和 LLM 历史，替换任务提示并生成新计划，强制下一次高层技能
+选择；掉线 agent 持续输出零动作。恢复完成后检测器继续监控存活 agent，不会把
+已处理的 dropout 再次报为 hang。新 episode（包括重复 ID）重置恢复计数和故障状态。
+
+恢复审计写入 `<run_label>_recovery.jsonl`，即使关闭 trajectory 仍记录。开启轨迹后，
+相同事件也写入 trajectory JSONL 和 TXT 的 `Recovery_Event` 行：
+
+- `failure_detected`：检测到的掉线 agent。
+- `tasks_reassigned`：旧归属、当前已满足目标、未完成任务和转交结果。
+- `agent_replanned`：存活 agent 的新任务已完成规划。
+- `recovery_completed`：重规划完成，可以恢复执行；**不代表 episode 已成功**。
+- `recovery_failed`：无法恢复的具体原因，随后沿用 crash 退出路径。
+
+指标新增 `error_recovery.attempts`、`error_recovery.recoveries` 和
+`error_recovery.transferred_tasks`，最终任务成功仍看 `pddl_success`。
+
+这是最小接管基线，未做能力、可达性或最优分配搜索，因此接管不保证任务最终成功。
+只支持 AND 连接的原子目标；没有存活 agent、未完成目标绑定掉线 agent、目标物体
+仍被掉线 agent 抓持等情况会明确报告恢复失败，不会改写任务判分条件。
+hang 和 message-loop 保留原有检测终止方式。
+
+无需模型凭据的原生仿真调试入口是
+`PYTHONPATH=habitat-mas python -m habitat_mas.test.native_dropout_recovery_smoke`，
+后接与 `python -m habitat_baselines.run` 相同的参数（包括单 episode 数据路径、
+dropout 注入步和 recovery 开关）。它替换 LLM 为固定测试模型，保留真实仿真、
+故障检测、任务接管和分层策略；仅用于验证控制链路，不用于报告模型恢复成功率。
 
 新录制的轨迹在高层决策中保存 `replay_context`，包含任务分配、模型对话历史和
 通信队列，回放时恢复这些上下文。**旧日志没有这些信息时，仅能用已记录的决策
@@ -278,6 +334,7 @@ PYTHONPATH=habitat-mas python -m unittest \
   habitat_mas.test.test_agent_hang_fault \
   habitat_mas.test.test_agent_hang_policy \
   habitat_mas.test.test_trajectory_replay \
+  habitat_mas.test.test_dropout_recovery \
   habitat_mas.test.test_agent_dropout_fault -v
 ```
 

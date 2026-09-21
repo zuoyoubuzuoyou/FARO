@@ -730,6 +730,14 @@ class MultiLLMPolicy(MultiPolicy):
                     AgentMessageBus.drop_agent(agent_i_handle)
 
                 active_event = self._active_dropout_events.get(state_key)
+                if active_event is None and agent_i_handle in AgentMessageBus.dropped_agents:
+                    # Membership loss is sufficient; recovery must not depend
+                    # on an injection schedule or call a physically offline agent.
+                    active_event = {
+                        "agent": agent_i_handle, "trigger_domain": "membership",
+                        "simulator_step": simulator_step, "decision_step": decision_step,
+                    }
+                    self._active_dropout_events[state_key] = active_event
                 dropout_active.append(active_event is not None)
                 dropout_events.append(trigger_event)
                 active_dropout_events.append(active_event)
@@ -769,7 +777,16 @@ class MultiLLMPolicy(MultiPolicy):
             except DetectedSystemCrash as error:
                 error.fault_events = [event for state in agent_fault_states
                                       for event in (state[1][0], state[4][0]) if event is not None]
-                raise
+                recovery = kwargs.get("dropout_recovery")
+                if recovery is None or error.event["reason"] != "agent_dropout":
+                    raise
+                recovery.recover(
+                    error, error_detector, self._active_policies,
+                    envs_text_context[0], text_goal, kwargs["get_recovery_context"],
+                )
+                # Recovery initialized/replanned the surviving team already,
+                # including step-zero dropout before the initial discussion.
+                envs_agent_arguments = []
 
         if replay is None:
             envs_agent_arguments = [group_discussion(**arguments) for arguments in envs_agent_arguments]

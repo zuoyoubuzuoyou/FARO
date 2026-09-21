@@ -459,6 +459,20 @@ class RearrangeTask(NavigationTask):
             robot_config = self._robot_config[current_episode_idx]["agents"]
         return get_text_context(self._sim, robot_config)
 
+    def get_recovery_context(self) -> dict:
+        """Read current goal truth and physical state only when recovery triggers."""
+        from habitat_mas.error_recovery import RecoveryError, snapshot_goals
+
+        try:
+            goals = snapshot_goals(self.pddl_problem)
+        except RecoveryError as error:
+            return {"unsupported_reason": str(error)}
+        return {
+            "goals": goals,
+            "simulator_state": self.get_dynamic_state_snapshot(),
+            "scene_description": self.get_task_text_context()["scene_description"],
+        }
+
     @staticmethod
     def _snapshot_vector(value: Any) -> List[float]:
         return [float(component) for component in value]

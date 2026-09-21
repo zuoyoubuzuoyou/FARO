@@ -43,6 +43,7 @@ from habitat_mas.fault_injection.trajectory import (
 from habitat_mas.fault_injection.replay import CleanPrefixReplay
 from habitat_mas.fault_injection.naming import output_run_stem
 from habitat_mas.error_detection import ErrorDetector, ErrorDetectionSpec, DetectedSystemCrash, progress_signature
+from habitat_mas.error_recovery import DropoutRecovery
 from habitat_mas.agents.message_bus import AgentMessageBus
 
 class HabitatMASEvaluator(Evaluator):
@@ -75,6 +76,8 @@ class HabitatMASEvaluator(Evaluator):
         metrics = {**context["metrics"], **detector.metrics(), "pddl_success": 0.0,
                    "num_steps": float(context["completed_steps"]),
                    "error_detection.detected_step": float(error.event["simulator_step"])}
+        if context.get("recovery") is not None:
+            metrics.update(context["recovery"].metrics())
         report = {**error.event, "done": True, "completed_steps": context["completed_steps"],
                   "env_step_executed": context["transition"] is not None,
                   "reward_total": context["reward_total"], "metrics": metrics,
@@ -127,6 +130,9 @@ class HabitatMASEvaluator(Evaluator):
         run_label = config.habitat_baselines.run_label
         detection_spec = ErrorDetectionSpec.from_config(config.habitat_baselines.error_detection)
         detector = ErrorDetector(detection_spec) if detection_spec.enabled else None
+        recovery_enabled = config.habitat_baselines.error_recovery.enabled
+        if recovery_enabled and detector is None:
+            raise ValueError("error_recovery.enabled requires error_detection.enabled=True")
         if detector is not None and config.habitat_baselines.num_environments != 1:
             raise ValueError("Error detection currently supports the EMOS single-environment evaluator")
         replay_config = config.habitat_baselines.fault_injection.replay
@@ -165,6 +171,12 @@ class HabitatMASEvaluator(Evaluator):
             if record_trajectory
             else None
         )
+        recovery = DropoutRecovery(
+            event_path=Path(output_dir) / (
+                output_run_stem(run_label, fault_name if fault_spec.enabled else "clean") + "_recovery.jsonl"
+            ),
+            record_event=trajectory_recorder.record_recovery_event if trajectory_recorder is not None else None,
+        ) if recovery_enabled else None
         if trajectory_recorder is not None or detector is not None:
             envs.call(
                 ["set_task_dynamic_state_capture"] * envs.num_envs,
@@ -265,6 +277,7 @@ class HabitatMASEvaluator(Evaluator):
         pbar = tqdm.tqdm(total=number_of_eval_episodes * evals_per_ep)
         self._crash_context = {
             "detector": detector, "trajectory_recorder": trajectory_recorder,
+            "recovery": recovery,
             "fault_recorder": fault_recorder, "pbar": pbar,
             "report_path": Path(output_dir) / (
                 output_run_stem(run_label, fault_name if fault_spec.enabled else "clean") + "_crash.json"
@@ -303,6 +316,8 @@ class HabitatMASEvaluator(Evaluator):
                     if detector is not None:
                         ep = current_episodes_info[i]
                         detector.reset(ep.scene_id, ep.episode_id, config.habitat.simulator.agents.keys())
+                        if recovery is not None:
+                            recovery.reset()
                         self._crash_context.update(
                             completed_steps=0, reward_total=0.0, transition=None,
                             last_state=envs.call(["get_task_dynamic_state"])[0],
@@ -349,6 +364,8 @@ class HabitatMASEvaluator(Evaluator):
                     replay_row=replay_row,
                     record_replay_context=trajectory_recorder is not None,
                     error_detector=detector,
+                    dropout_recovery=recovery,
+                    get_recovery_context=lambda: envs.call(["get_task_recovery_context"])[0],
                     **space_lengths,
                 )
                 if action_data.should_inserts is None:
@@ -423,6 +440,8 @@ class HabitatMASEvaluator(Evaluator):
                 )
                 detector.after_step(simulator_steps[0])
                 infos[0].update(detector.metrics())
+                if recovery is not None:
+                    infos[0].update(recovery.metrics())
             # Note that `policy_infos` represents the information about the
             # action BEFORE `observations` (the action used to transition to
             # `observations`).

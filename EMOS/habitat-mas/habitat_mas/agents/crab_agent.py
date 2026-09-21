@@ -143,6 +143,24 @@ class CrabAgent:
         print("===============CrabAgent Subtasks==============")
         print(response)
 
+    def replan(self, subtask_description: str, recovery_context: str) -> None:
+        """Replace the assignment and plan from current state, retaining history."""
+        self.subtask_description = subtask_description
+        self.llm_model.set_system_message(ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE.format(
+            robot_type=self.robot_type, robot_key=self.name,
+            subtask_description=subtask_description,
+        ) + "\nRecovery execution constraints:\n" + recovery_context)
+        self.llm_model.chat(
+            "Recovery supersedes the previous task assignment and action plan.\n"
+            + recovery_context + "\nYour remaining assignment:\n" + subtask_description
+            + "\nAvailable actions:\n" + self.action_prompt
+            + "\nReplan a full action sequence for this assignment while preserving satisfied goals.",
+            crab_planning=True,
+        )
+        # The next high-level action must receive fresh scene context, not the
+        # usual prompt claiming the interrupted low-level action completed.
+        self.start_act = False
+
     def export_replay_context(self) -> dict:
         """Record model memory and communication at a high-level boundary."""
         def encode(value):

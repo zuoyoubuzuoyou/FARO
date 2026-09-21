@@ -119,6 +119,10 @@ class RLTaskEnv(habitat.RLEnv):
         )
         return self._env.task.get_task_text_context()
 
+    def get_task_recovery_context(self) -> dict:
+        """Read fresh PDDL goal truth and physical state at a recovery boundary."""
+        return self._env.task.get_recovery_context()
+
     def get_task_dynamic_state(self) -> dict:
         """Return a JSON-serializable post-step task state snapshot."""
 

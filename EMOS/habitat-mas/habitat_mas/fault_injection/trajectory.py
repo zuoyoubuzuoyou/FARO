@@ -358,6 +358,14 @@ class AgentDropoutTrajectoryRecorder:
             "objects": raw_state.get("objects", []),
         }
 
+    def record_recovery_event(self, event):
+        """Persist the same recovery audit in JSONL and the readable episode trace."""
+        self.record(event)
+        self._append_text(
+            event["episode_id"],
+            "Recovery_Event: " + json.dumps(_jsonable(event), ensure_ascii=False) + "\n\n",
+        )
+
     def record_system_crash(self, report, *, terminal_step_recorded=False):
         """A pre-action abort is a terminal event, never a fabricated env step."""
         self.record(report)

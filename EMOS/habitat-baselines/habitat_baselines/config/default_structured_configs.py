@@ -524,6 +524,12 @@ class ErrorDetectionConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class ErrorRecoveryConfig(HabitatBaselinesBaseConfig):
+    # Opt in to preserve detection-only experiments and clean replay prefixes.
+    enabled: bool = False
+
+
+@dataclass
 class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
     # Shared by trajectories, fault events and detected-crash reports.
@@ -531,6 +537,7 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # An empty label uses the actual run type: clean, dropout or hang.
     run_label: str = ""
     error_detection: ErrorDetectionConfig = field(default_factory=ErrorDetectionConfig)
+    error_recovery: ErrorRecoveryConfig = field(default_factory=ErrorRecoveryConfig)
     # task config can be a list of configs like "A.yaml,B.yaml"
     # If habitat_baselines.evaluate is true, the run will be in evaluation mode
     # replaces --run-type eval when true
