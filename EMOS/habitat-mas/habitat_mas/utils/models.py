@@ -84,7 +84,7 @@ class OpenAIModel:
         self,
         system_prompt: str,
         action_space: List[Action],
-        model="gpt-5.5",
+        model="gpt-6-sol",
         window_size=None,
         discussion_stage=False,
         code_execution=False,

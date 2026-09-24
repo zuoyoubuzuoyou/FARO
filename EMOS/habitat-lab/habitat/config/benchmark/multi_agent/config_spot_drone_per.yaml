@@ -76,6 +76,7 @@ defaults:
 # - 开头 /：从 Hydra 配置搜索路径根部开始
 
   - /habitat/task/measurements:
+    - object_to_goal_distance # 放置动作的距离传感器依赖此测量项
     - pddl_success # 最终 PDDL 目标是否成立
     - num_steps #episode 执行步数
     - did_agents_collide # 机器人是否发生碰撞
@@ -85,6 +86,7 @@ defaults:
     - rearrange_cooperate_reward # 多机器人协作奖励
   # 配置了任务传感器
   - /habitat/task/lab_sensors:
+    - object_to_goal_distance_sensor # OraclePlacePolicy 用于判断何时释放物体
     - relative_resting_pos_sensor
     - target_start_sensor
     - goal_sensor

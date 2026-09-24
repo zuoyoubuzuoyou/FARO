@@ -56,8 +56,8 @@ def load_dispatch():
         "build_agent_dropout_event": build_agent_dropout_event,
         "PolicyActionData": SimpleNamespace,
         "torch": SimpleNamespace(
-            zeros_like=lambda value: tensor(), zeros=lambda *a, **kw: tensor(),
-            full=lambda shape, value, **kw: value, long=int,
+            zeros_like=lambda value, **kw: tensor(), zeros=lambda *a, **kw: tensor(),
+            full=lambda shape, value, **kw: value, long=int, float32=float,
         ),
         "np": SimpleNamespace(zeros=lambda *a, **kw: False),
     }
@@ -122,12 +122,14 @@ class AgentHangPolicyTest(unittest.TestCase):
         self.assertEqual(self.agents[0].act.call_count, 2)
         self.assertEqual(self.agents[1].act.call_count, 1)
         self.assertIs(actions[1].rnn_hidden_states, self.hidden_parts[1])
+        self.assertIsNone(actions[1].skill_id)
         self.assertFalse(actions[1].should_inserts)
         self.assertFalse(actions[1].take_actions.any().item())
         self.assertIn("hang_event", actions[1].policy_info[0])
         for action in actions:
             action.actions.__setitem__.assert_not_called()
         actions = self.act(999, config)
+        self.assertIsNone(actions[1].skill_id)
         self.assertNotIn("hang_event", actions[1].policy_info[0])
         self.assertEqual(self.policy._decision_steps[("15", "agent_1")], 1)
         self.assertEqual(self.agents[0].act.call_count, 3)
@@ -180,7 +182,19 @@ class AgentHangPolicyTest(unittest.TestCase):
         actions = self.act(1, {}, dropout={"enabled": True, "agent": "agent_1", "simulator_step": 1})
         self.assertIn("dropout_event", actions[1].policy_info[0])
         self.assertNotIn("hang_active", actions[1].policy_info[0])
+        self.assertIsNone(actions[1].skill_id)
+        self.assertIs(actions[1].rnn_hidden_states, self.hidden_parts[1])
+        self.assertFalse(actions[1].should_inserts)
+        self.assertFalse(actions[1].take_actions.any().item())
         self.assertEqual(self.agents[1].act.call_count, 1)
+
+    def test_no_skill_is_not_treated_as_wait(self):
+        self.agents[1].act.side_effect = lambda *args, **kwargs: SimpleNamespace(
+            policy_info=[{}], skill_id=None, actions=tensor(),
+        )
+        actions = self.act(0, {}, starting=True)
+        for action in actions:
+            action.actions.__setitem__.assert_not_called()
 
     def test_invalid_target_and_conflicting_faults_fail_before_execution(self):
         with self.assertRaisesRegex(FaultInjectionError, "unknown"):
@@ -252,6 +266,28 @@ class AgentHangPolicyTest(unittest.TestCase):
         self.act(0, {}, episode="16", starting=True, dropout=config)
         self.assertEqual(AgentMessageBus.active_members(), ["agent_0", "agent_1"])
         self.assertIsNone(AgentMessageBus.send_request("agent_0", "agent_1", "new"))
+
+
+class FaultActionDtypeTest(unittest.TestCase):
+    def test_fault_noop_env_actions_do_not_inherit_integer_buffer_dtype(self):
+        import numpy as np
+        import torch
+        from gym.spaces import Box
+        from habitat_baselines.rl.multi_agent.multi_llm_policy import MultiLLMPolicy
+        for fault_name in ('dropout', 'hang'):
+            with self.subTest(fault_name=fault_name):
+                previous = torch.zeros(1, 34, dtype=torch.long)
+                result = MultiLLMPolicy._make_agent_fault_action(
+                    None, torch.zeros(1, 2), previous, [None],
+                    [{'trigger_domain': 'simulator_step', 'simulator_step': 1, 'decision_step': 0}],
+                    [1], [0], fault_name=fault_name)
+                space = Box(-1, 1, (34,), dtype=np.float32)
+                action = np.clip(result.env_actions.cpu()[0].numpy(), space.low, space.high)
+                self.assertTrue(space.contains(action), f'Invalid Gym action dtype: {action.dtype}')
+                self.assertEqual(np.count_nonzero(action), 0)
+                self.assertEqual(result.actions.dtype, previous.dtype)
+                self.assertIsNone(result.skill_id)
+                self.assertFalse(result.should_inserts.any())
 
 
 if __name__ == "__main__":
