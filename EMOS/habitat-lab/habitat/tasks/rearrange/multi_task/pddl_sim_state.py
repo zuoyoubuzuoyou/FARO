@@ -148,6 +148,8 @@ class PddlRobotState:
         
          # add detected objects checking
         if isinstance(self.detected_object, PddlEntity):
+            if robot_id in getattr(sim_info.sim, "offline_agent_ids", ()):
+                return False
             obj_idx = cast(int, sim_info.search_for_entity(self.detected_object))
             # absolute object id = object id + semantic_offset
             abs_obj_id = sim_info.sim.scene_obj_ids[obj_idx] + sim_info.sim.habitat_config.object_ids_start
@@ -160,7 +162,7 @@ class PddlRobotState:
             elif "detected_objects" in sim_info.env.sensor_suite.sensors:
                 obs = sim_info.env.sensor_suite.get(f"detected_objects").get_observation(observations)
             else:
-                obs = [abs_obj_id]
+                obs = []
             if abs_obj_id not in obs:
                 return False
 
@@ -402,9 +404,11 @@ class PddlSimState:
         sim_obs = sim_info.sim.get_sensor_observations()
         observations = sim_info.sim.sensor_suite.get_observations(sim_obs)
 
-        obs = [abs_obj_id]
         num_robots = len(sim_info.robot_ids)
         for i in range(num_robots):
+            if i in getattr(sim_info.sim, "offline_agent_ids", ()):
+                continue
+            obs = []
             if f"agent_{i}_detected_objects" in sim_info.env.sensor_suite.sensors:
                 obs = sim_info.env.sensor_suite.get(f"agent_{i}_detected_objects").get_observation(observations)
             elif "detected_objects" in sim_info.env.sensor_suite.sensors:

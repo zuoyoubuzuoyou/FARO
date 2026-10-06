@@ -119,6 +119,10 @@ class RLTaskEnv(habitat.RLEnv):
         )
         return self._env.task.get_task_text_context()
 
+    def set_task_offline_agents(self, agents) -> None:
+        """Synchronize policy membership with simulator-side perception."""
+        self._env.task.set_offline_agents(agents)
+
     def get_task_recovery_context(self) -> dict:
         """Read fresh PDDL goal truth and physical state at a recovery boundary."""
         return self._env.task.get_recovery_context()

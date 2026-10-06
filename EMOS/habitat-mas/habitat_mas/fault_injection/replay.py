@@ -45,19 +45,28 @@ def compare_recorded(expected, actual, *, path="value", atol=1e-5):
         raise ReplayMismatchError(f"{path}: unsupported recorded value")
 
 
+def replay_object_state(obj):
+    """Use the recorded handle for identity; simulator IDs are run-local."""
+    if isinstance(obj, dict) and isinstance(obj.get("handle"), str) and obj["handle"]:
+        return {key: value for key, value in obj.items() if key != "object_id"}
+    # Legacy/unresolved objects have no stable handle: keep their ID check.
+    return obj
+
+
 def physical_state(state):
-    """Compare all recorded physical fields, excluding trace annotations."""
+    """Compare physical fields and stable identities, excluding annotations."""
     if not isinstance(state, dict):
         raise ValueError("Replay requires a simulator_state mapping")
     agents = state.get("agents", {})
     if not isinstance(agents, dict) or not agents or not isinstance(state.get("objects"), list) or state.get("timing") != "post_env_step":
         raise ValueError("Replay requires post_env_step agent/object snapshots in JSONL")
     fields = ("position", "rotation", "held_object")
-    result = {"agents": {}, "objects": state["objects"]}
+    result = {"agents": {}, "objects": [replay_object_state(obj) for obj in state["objects"]]}
     for name, agent in agents.items():
         if not isinstance(agent, dict) or any(key not in agent for key in fields):
             raise ValueError(f"Replay requires position, rotation and held_object for {name}")
         result["agents"][name] = {key: agent[key] for key in fields}
+        result["agents"][name]["held_object"] = replay_object_state(agent["held_object"])
     return result
 
 

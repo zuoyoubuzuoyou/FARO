@@ -365,6 +365,9 @@ class HabitatMASEvaluator(Evaluator):
                     record_replay_context=trajectory_recorder is not None,
                     error_detector=detector,
                     dropout_recovery=recovery,
+                    set_offline_agents=lambda agents: envs.call(
+                        ["set_task_offline_agents"], [{"agents": agents}]
+                    ),
                     get_recovery_context=lambda: envs.call(["get_task_recovery_context"])[0],
                     **space_lengths,
                 )
@@ -397,7 +400,7 @@ class HabitatMASEvaluator(Evaluator):
                         a.numpy(),
                         env_spec.action_space.low,
                         env_spec.action_space.high,
-                    )
+                    ).astype(env_spec.action_space.dtype, copy=False)
                     for a in action_data.env_actions.cpu()
                 ]
             else:

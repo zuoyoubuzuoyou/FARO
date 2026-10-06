@@ -265,6 +265,7 @@ class RearrangeTask(NavigationTask):
     @add_perf_timing_func()
     def reset(self, episode: Episode, fetch_observations: bool = True):
         self._episode_id = episode.episode_id
+        self._sim.offline_agent_ids = frozenset()
         self._ignore_collisions = []
 
         if self._sim_reset:
@@ -313,6 +314,7 @@ class RearrangeTask(NavigationTask):
                 observations=obs, episode=episode, task=self, should_time=True, physics_target_sps=self._physics_target_sps
             )
         )
+        self._mask_offline_observations(obs)
         return obs
 
     def _is_violating_safe_drop(self, action_args):
@@ -336,6 +338,7 @@ class RearrangeTask(NavigationTask):
         ):
             action_args["grip_pick_action"] = None
         obs = super().step(action=action, episode=episode)
+        self._mask_offline_observations(obs)
 
         self.prev_coll_accum = copy.copy(self.coll_accum)
         self._cur_episode_step += 1
@@ -458,6 +461,35 @@ class RearrangeTask(NavigationTask):
             assert "agents" in self._robot_config[current_episode_idx]
             robot_config = self._robot_config[current_episode_idx]["agents"]
         return get_text_context(self._sim, robot_config)
+
+    def set_offline_agents(self, agents) -> None:
+        """Apply logical dropout before goal evaluation, including recovery."""
+        names = list(self._sim.agents_mgr.agent_names)
+        unknown = set(agents) - set(names)
+        if unknown:
+            raise ValueError(f"Unknown offline agents: {sorted(unknown)}")
+        offline = frozenset(names.index(name) for name in agents)
+        if offline == getattr(self._sim, "offline_agent_ids", frozenset()):
+            return
+        self._sim.offline_agent_ids = offline
+        problem = getattr(self, "pddl_problem", None)
+        if problem is not None:
+            # This task evaluates live perception without a per-step cache
+            # lifecycle. Clear stale truth without enabling persistent caching.
+            problem.sim_info.pred_truth_cache = None
+        for obs in (getattr(self, "_prev_task_obs", None),
+                    getattr(self._sim, "_prev_sim_obs", None)):
+            if obs is not None:
+                self._mask_offline_observations(obs)
+
+    def _mask_offline_observations(self, observations) -> None:
+        """Keep observation shapes while making offline sensor data unavailable."""
+        names = list(self._sim.agents_mgr.agent_names)
+        for index in getattr(self._sim, "offline_agent_ids", ()):
+            prefix = names[index] + "_"
+            for key, value in list(observations.items()):
+                if key.startswith(prefix):
+                    observations[key] = np.zeros_like(value)
 
     def get_recovery_context(self) -> dict:
         """Read current goal truth and physical state only when recovery triggers."""

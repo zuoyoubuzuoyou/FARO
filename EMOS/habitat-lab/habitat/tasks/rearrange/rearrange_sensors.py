@@ -1444,7 +1444,12 @@ class DetectedObjectsSensor(UsesArticulatedAgentInterface, Sensor):
     def get_observation(self, observations, *args, **kwargs):
         """ Get the detected objects from the semantic sensor data """
         
-        observation_keys = list(observations.keys())
+        offline = getattr(self._sim, "offline_agent_ids", ())
+        if self.agent_id in offline:
+            return np.empty(0, dtype=np.int64)
+        offline_prefixes = tuple(f"agent_{i}_" for i in offline)
+        observation_keys = [key for key in observations
+                            if not key.startswith(offline_prefixes)]
         
         # Retrieve the semantic sensor data
         if self.agent_id is None:
@@ -1468,6 +1473,8 @@ class DetectedObjectsSensor(UsesArticulatedAgentInterface, Sensor):
             sensor_detected_objects[key] = [obj_id for obj_id, count in objects_count.items() if count > self.pixel_threshold]
         
         # Concatenate all detected objects from all sensors
+        if not sensor_detected_objects:
+            return np.empty(0, dtype=np.int64)
         detected_objects = np.unique(np.concatenate(list(sensor_detected_objects.values())))
         
         return detected_objects

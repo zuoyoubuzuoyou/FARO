@@ -246,6 +246,8 @@ def build_agent_dropout_event(
             "peer_observation": "membership_update",
             "policy_state": "frozen",
             "environment_action": "zero_noop",
+            "perception": "unavailable",
+            "goal_evaluation": "offline_observations_excluded",
         },
         "simulator_agent_removed": False,
         "logical_agent_active": False,

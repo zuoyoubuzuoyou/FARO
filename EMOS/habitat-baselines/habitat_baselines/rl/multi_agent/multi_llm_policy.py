@@ -540,19 +540,19 @@ class MultiLLMPolicy(MultiPolicy):
                     info["execution_override"] = fault_action
             policy_info.append(info)
 
-        wait_id = policy._name_to_idx["wait"]
         return PolicyActionData(
             rnn_hidden_states=agent_rnn_hidden_states,
             actions=torch.zeros_like(agent_prev_actions),
-            take_actions=torch.zeros_like(agent_prev_actions),
+            # The policy's history buffer can be integer even though Habitat's
+            # continuous environment action space requires float32.
+            take_actions=torch.zeros_like(agent_prev_actions, dtype=torch.float32),
             values=torch.zeros((batch_size, 1), device=device),
             action_log_probs=torch.zeros((batch_size, 1), device=device),
             policy_info=policy_info,
             # False freezes both the target policy state and its prev_action.
             should_inserts=np.zeros((batch_size, 1), dtype=bool),
-            skill_id=torch.full(
-                (batch_size,), wait_id, dtype=torch.long, device=device
-            ),
+            # Fault overrides suspend execution; they do not execute Wait.
+            skill_id=None,
         )
 
     def act(
@@ -674,6 +674,7 @@ class MultiLLMPolicy(MultiPolicy):
                 envs_agent_arguments.append(agent_arguments)
                 self._decision_steps.clear()
                 self._active_dropout_events.clear()
+                self._perception_offline_agents = None
                 self._hang_states.clear()
                 
                 # Invalidate all action policies and flag them to be reinitialized
@@ -760,6 +761,16 @@ class MultiLLMPolicy(MultiPolicy):
                 dropout_active, dropout_events, active_dropout_events,
                 agent_decision_steps, hang_events, active_hang_events,
             ))
+
+        # Apply dropout to environment perception before recovery snapshots or
+        # surviving policies run. Vector environments live in another process.
+        set_offline_agents = kwargs.get("set_offline_agents")
+        offline_agents = tuple(f"agent_{i}" for i, state in enumerate(agent_fault_states)
+                               if state[0][0])
+        if (set_offline_agents is not None and
+                getattr(self, "_perception_offline_agents", None) != offline_agents):
+            set_offline_agents(list(offline_agents))
+            self._perception_offline_agents = offline_agents
 
         # An external watchdog may stop the whole team BEFORE any individual
         # policy or LLM executes at this step. Status, not the schedule, is input.
@@ -923,7 +934,7 @@ class MultiLLMPolicy(MultiPolicy):
                 ):
                     continue
                 wait_id = self._active_policies[agent_id]._name_to_idx['wait']
-                if agent_action.skill_id != wait_id:
+                if agent_action.skill_id is None or agent_action.skill_id != wait_id:
                     should_terminate = False
                     break
             if should_terminate:

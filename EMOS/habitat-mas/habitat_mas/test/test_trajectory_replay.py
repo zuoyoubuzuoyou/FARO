@@ -148,6 +148,61 @@ class ReplayTest(unittest.TestCase):
                     replay.verify_result(row, state, reward, done, metrics)
                 self.assertEqual(replay.verified_steps, 0)
 
+    def object_identity_row(self):
+        row = copy.deepcopy(self.rows[0])
+        row["simulator_state"]["objects"] = [
+            {"object_id": 88, "handle": "tuna_:0000", "goal_name": "any_targets|0",
+             "position": [1., 2., 3.]},
+            {"object_id": 87, "handle": "marbles_:0000", "goal_name": "any_targets|1",
+             "position": [4., 5., 6.]},
+        ]
+        row["simulator_state"]["agents"]["agent_0"]["held_object"] = {
+            "object_id": 88, "handle": "tuna_:0000", "goal_name": "any_targets|0",
+        }
+        return row
+
+    def test_runtime_object_ids_can_change_for_the_same_named_objects(self):
+        row = self.object_identity_row()
+        original = copy.deepcopy(row)
+        state = copy.deepcopy(row["simulator_state"])
+        state["objects"][0]["object_id"] = 87
+        state["objects"][1]["object_id"] = 88
+        state["agents"]["agent_0"]["held_object"]["object_id"] = 87
+        before = copy.deepcopy(state)
+        replay = self.start()
+        replay.verify_result(row, state, row["reward"], row["done"], row["metrics"])
+        self.assertEqual(replay.verified_steps, 1)
+        self.assertEqual(row, original)
+        self.assertEqual(state, before)
+
+    def test_named_object_identity_and_physics_still_have_to_match(self):
+        row = self.object_identity_row()
+        for field in ("handle", "goal_name", "position", "held_object", "missing_object"):
+            with self.subTest(field=field):
+                state = copy.deepcopy(row["simulator_state"])
+                if field in ("handle", "goal_name"):
+                    state["objects"][0][field] = "different_object"
+                elif field == "position":
+                    state["objects"][0][field][0] += .1
+                elif field == "held_object":
+                    state["agents"]["agent_0"][field]["handle"] = "marbles_:0000"
+                else:
+                    state["objects"].pop()
+                replay = self.start()
+                with self.assertRaises(ReplayMismatchError):
+                    replay.verify_result(row, state, row["reward"], row["done"], row["metrics"])
+                self.assertEqual(replay.verified_steps, 0)
+
+    def test_unnamed_objects_still_require_matching_runtime_ids(self):
+        for handle in (None, "", 123):
+            with self.subTest(handle=handle):
+                row = copy.deepcopy(self.rows[0])
+                row["simulator_state"]["objects"][0]["handle"] = handle
+                state = copy.deepcopy(row["simulator_state"])
+                state["objects"][0]["object_id"] += 1
+                with self.assertRaisesRegex(ReplayMismatchError, "object_id"):
+                    self.start().verify_result(row, state, row["reward"], row["done"], row["metrics"])
+
     def test_tolerance_and_nonfinite_values(self):
         compare_recorded([1.], [1.000001])
         for actual in (float("nan"), float("inf"), True, "1"):
