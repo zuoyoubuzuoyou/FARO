@@ -127,6 +127,12 @@ class RLTaskEnv(habitat.RLEnv):
         """Read fresh PDDL goal truth and physical state at a recovery boundary."""
         return self._env.task.get_recovery_context()
 
+    def get_task_fault_context(self):
+        return self._env.task.get_fault_context()
+
+    def set_task_localization_fault(self, agent, entity, offset, fault_id, simulator_step):
+        return self._env.task.set_localization_fault(agent, entity, offset, fault_id, simulator_step)
+
     def get_task_dynamic_state(self) -> dict:
         """Return a JSON-serializable post-step task state snapshot."""
 

@@ -46,8 +46,13 @@ def build_parser(*, clean: bool = False) -> argparse.ArgumentParser:
                             replay_trajectory=None, replay_atol=1e-5)
     else:
         parser.add_argument("--fault", required=True, type=normalize_fault,
-                            choices=list(FAULTS), help="agent_dropout/dropout or agent_hang/hang")
+                            choices=list(FAULTS), help="Registered structure and latent execution faults")
         parser.add_argument("--agent", default="agent_0", help="Target agent, default: agent_0")
+        parser.add_argument("--duration-steps", type=int, help="Fault window length; -1 means until episode end")
+        parser.add_argument("--object", help="Affected PDDL object, e.g. any_targets|0")
+        parser.add_argument("--replacement-object", help="Wrong subgoal target (a different scene entity)")
+        parser.add_argument("--delay-steps", type=int, help="Message delivery delay in simulator steps")
+        parser.add_argument("--position-offset", type=float, nargs=3, metavar=("DX", "DY", "DZ"), help="Localization bias in world metres (Y is vertical)")
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--episode", help="Dataset episode ID, or comma-separated IDs")
     selection.add_argument("--random-episodes", type=int, metavar="N",
@@ -221,9 +226,34 @@ def resolve_environment(args, overrides: list[str]):
     )
 
 
+def fault_parameters(args) -> dict:
+    applicable = {
+        "action_noop": {"duration_steps"},
+        "wrong_subgoal": {"object", "replacement_object"},
+        "message_delay": {"duration_steps", "delay_steps"},
+        "object_localization": {"duration_steps", "object", "position_offset"},
+    }
+    supplied = {key: getattr(args, key, None) for key in (
+        "duration_steps", "object", "replacement_object", "delay_steps", "position_offset")}
+    supplied = {key: value for key, value in supplied.items() if value is not None}
+    unsupported = set(supplied) - applicable.get(args.fault, set())
+    if unsupported:
+        raise ValueError(f"Parameters do not apply to {args.fault}: {', '.join(sorted(unsupported))}")
+    required = {"wrong_subgoal": {"object", "replacement_object"},
+                "object_localization": {"object", "position_offset"},
+                "message_delay": {"delay_steps"}}.get(args.fault, set())
+    if required - set(supplied):
+        raise ValueError(f"{args.fault} requires {', '.join('--' + key.replace('_', '-') for key in sorted(required - set(supplied)))}")
+    if args.fault in applicable:
+        defaults = FAULTS[args.fault].spec_type()
+        supplied = {key: supplied.get(key, getattr(defaults, key)) for key in sorted(applicable[args.fault])}
+    return supplied
+
+
 def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
     validate_overrides(overrides)
     original_overrides = list(overrides)
+    parameters = {} if args.clean else fault_parameters(args)
     overrides = effective_overrides(args, overrides)
     # Both convenience entry points record by default; explicit common options
     # or their short aliases take precedence over these launcher defaults.
@@ -288,13 +318,15 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
     outputs = {
         "crash_report": str(output_dir / f"{stem}_crash.json"),
         "events": None if args.clean else str(output_dir / f"{stem}_events.jsonl"),
+        "summary": str(output_dir / f"{stem}_summary.json") if args.fault in (
+            "action_noop", "wrong_subgoal", "message_delay", "object_localization") else None,
         "trajectory": str(output_dir / f"{stem}_trajectory.jsonl") if record_trajectory else None,
         "traces": [
             str(output_dir / f"{stem}_trace-episode_{episode_id}.txt")
             for episode_id in trace_episode_ids
         ] if record_trajectory else [],
     }
-    for path in [outputs["events"], outputs["trajectory"], outputs["crash_report"], *outputs["traces"]]:
+    for path in [outputs["events"], outputs["summary"], outputs["trajectory"], outputs["crash_report"], *outputs["traces"]]:
         if path is not None and Path(path).exists():
             raise FileExistsError(f"Output already exists: {path}; choose another --run-label")
     subset_path = run_dir / "episodes.json.gz"
@@ -317,7 +349,7 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
             command += [f"{definition.config_path}.enabled=False"]
         command.append('habitat_baselines.fault_injection.replay.path=""')
     else:
-        command += fault_overrides(args.fault, args.agent, schedule)
+        command += fault_overrides(args.fault, args.agent, schedule, parameters)
     if replay is not None:
         command += [
             f"habitat_baselines.fault_injection.replay.path={json.dumps(replay.path)}",
@@ -326,6 +358,7 @@ def prepare_run(args, overrides: list[str]) -> tuple[Path, list[str], dict]:
     plan = {
         "schema_version": 1, "mode": "clean" if args.clean else "faulty",
         "fault": None if args.clean else args.fault, "agent": args.agent,
+        "fault_parameters": parameters,
         "seed": args.seed, "config": args.config, "config_validated": config_checked,
         "emos_overrides": original_overrides,
         "source_dataset": str(dataset_path), "subset_dataset": str(subset_path),
@@ -370,6 +403,8 @@ def main(argv: list[str] | None = None, *, clean: bool = False) -> int:
         print(f"Replay clean prefix: {plan['replay']['path']} (atol={plan['replay']['atol']}); abort on divergence")
     if plan["outputs"]["events"] is not None:
         print(f"Events: {plan['outputs']['events']}")
+    if plan["outputs"]["summary"] is not None:
+        print(f"Fault effect summary: {plan['outputs']['summary']}")
     if plan["outputs"]["trajectory"] is not None:
         print(f"Trajectory JSONL: {plan['outputs']['trajectory']}")
         for trace in plan["outputs"]["traces"]:

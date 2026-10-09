@@ -176,7 +176,7 @@ def generate_region_objects_description(region_layer, region_id):
         
     return description
 
-def generate_objects_description(sim, object_layer):
+def generate_objects_description(sim, object_layer, position_estimates=None):
     """
     Generate description of objects, used when region layer is empty 
     """
@@ -193,7 +193,9 @@ def generate_objects_description(sim, object_layer):
         else:
             obj_name = obj.full_name
         
-        position = np.array(obj.center)
+        position = np.array((position_estimates or {}).get(obj_name, obj.center))
+        if obj_name in (position_estimates or {}):
+            description += f'Object "{obj_name}" is at position [{", ".join(f"{p:.3f}" for p in position)}]. '
         # Remove quotes in list 
         # position_str = ', '.join([f'{p:.1f}' for p in position])
         # description += f'Object "{obj_name}" is at the position [{position_str}]. '
@@ -205,10 +207,10 @@ def generate_objects_description(sim, object_layer):
         ]
         horizontal_dist = np.inf
         for nav_island in range(len(island_areas)):
-            snap_pos = sim.pathfinder.snap_point(obj.center, nav_island)
+            snap_pos = sim.pathfinder.snap_point(position, nav_island)
             if not np.isnan(snap_pos).any():
                 horizontal_dist = np.linalg.norm(
-                    np.array(snap_pos)[[0, 2]] - np.array(obj.center)[[0, 2]]
+                    np.array(snap_pos)[[0, 2]] - position[[0, 2]]
                 )
                 break
         description += f'The horizontal distance of "{obj_name}" to the nearest navigable point is {horizontal_dist:.1f}. '

@@ -502,11 +502,50 @@ class TrajectoryReplayConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class LatentFaultConfig(HabitatBaselinesBaseConfig):
+    enabled: bool = False
+    fault_id: str = ""
+    agent: str = "agent_0"
+    episode_id: str = ""
+    simulator_step: int = 0
+    simulator_step_schedule: str = ""
+    duration_steps: int = -1
+    object: str = "any_targets|0"
+    replacement_object: str = "any_targets|1"
+    delay_steps: int = 5
+    position_offset: List[float] = field(default_factory=lambda: [1.0, 0.0, 0.0])
+
+
+@dataclass
+class ActionFaultConfig(HabitatBaselinesBaseConfig):
+    action_noop: LatentFaultConfig = field(default_factory=LatentFaultConfig)
+
+
+@dataclass
+class PlanningFaultConfig(HabitatBaselinesBaseConfig):
+    wrong_subgoal: LatentFaultConfig = field(default_factory=LatentFaultConfig)
+
+
+@dataclass
+class CommunicationFaultConfig(HabitatBaselinesBaseConfig):
+    message_delay: LatentFaultConfig = field(default_factory=LatentFaultConfig)
+
+
+@dataclass
+class PerceptionFaultConfig(HabitatBaselinesBaseConfig):
+    object_localization: LatentFaultConfig = field(default_factory=LatentFaultConfig)
+
+
+@dataclass
 class FaultInjectionConfig(HabitatBaselinesBaseConfig):
     structure: StructureFaultConfig = field(
         default_factory=StructureFaultConfig
     )
     replay: TrajectoryReplayConfig = field(default_factory=TrajectoryReplayConfig)
+    action: ActionFaultConfig = field(default_factory=ActionFaultConfig)
+    planning: PlanningFaultConfig = field(default_factory=PlanningFaultConfig)
+    communication: CommunicationFaultConfig = field(default_factory=CommunicationFaultConfig)
+    perception: PerceptionFaultConfig = field(default_factory=PerceptionFaultConfig)
 
 
 @dataclass

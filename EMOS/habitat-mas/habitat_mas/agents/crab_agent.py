@@ -161,6 +161,20 @@ class CrabAgent:
         # usual prompt claiming the interrupted low-level action completed.
         self.start_act = False
 
+    def replace_subtask(self, subtask_description: str) -> None:
+        """Plan from a changed assignment, preserving memory and real task truth."""
+        self.subtask_description = subtask_description
+        self.llm_model.set_system_message(ROBOT_EXECUTION_SYSTEM_PROMPT_TEMPLATE.format(
+            robot_type=self.robot_type, robot_key=self.name, subtask_description=subtask_description,
+        ))
+        self.llm_model.chat(
+            "Your assignment has been updated. The previous action was interrupted, "
+            "and is not necessarily complete. Replace the previous action plan with a "
+            "full plan for this assignment:\n" + subtask_description
+            + "\nAvailable actions:\n" + self.action_prompt, crab_planning=True,
+        )
+        self.start_act = False
+
     def export_replay_context(self) -> dict:
         """Record model memory and communication at a high-level boundary."""
         def encode(value):

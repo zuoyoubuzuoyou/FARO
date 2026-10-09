@@ -149,6 +149,7 @@ class AgentDropoutTrajectoryRecorder:
                     "_pddl_action",
                     "_dropout_event",
                     "_hang_event",
+                    "_fault_events",
                 )
             )
             for key in policy_info
@@ -404,6 +405,8 @@ class AgentDropoutTrajectoryRecorder:
                 "simulator_step": int(simulator_step),
                 "joint_env_action": joint_env_action,
                 "policy_info": info,
+                "fault_events": [event for key, events in info.items() if key.endswith("_fault_events")
+                                 for event in events],
                 "agent_step_actions": agent_step_actions,
                 "simulator_state": dynamic_state,
                 "reward": reward,
@@ -484,6 +487,12 @@ class AgentDropoutTrajectoryRecorder:
                 )
 
         for key, value in info.items():
+            if key.endswith("_fault_events"):
+                for event in value:
+                    lines.append(
+                        f"Fault: {event.get('fault_type')}/{event.get('fault_subtype')} "
+                        + json.dumps(_jsonable(event), ensure_ascii=False)
+                    )
             if key.endswith("_hang_event") and isinstance(value, Mapping):
                 lines.append(
                     f"Fault: StructureFault/AgentHang {value.get('type')} "

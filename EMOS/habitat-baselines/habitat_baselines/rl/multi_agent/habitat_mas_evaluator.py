@@ -45,6 +45,8 @@ from habitat_mas.fault_injection.naming import output_run_stem
 from habitat_mas.error_detection import ErrorDetector, ErrorDetectionSpec, DetectedSystemCrash, progress_signature
 from habitat_mas.error_recovery import DropoutRecovery
 from habitat_mas.agents.message_bus import AgentMessageBus
+from habitat_mas.fault_injection.latent import read_latent_spec
+from habitat_mas.fault_injection.latent_runtime import LatentFaultRuntime
 
 class HabitatMASEvaluator(Evaluator):
     """
@@ -61,11 +63,42 @@ class HabitatMASEvaluator(Evaluator):
             # Configuration bugs, replay mismatches and API failures still raise
             # their original exceptions instead of being mislabeled.
             try:
+                self._finalize_latent_fault(error)
                 self._record_system_crash(error, writer, step_id)
             finally:
                 envs.close()  # All agents stop; no later episode is dispatched.
                 self._crash_context["pbar"].close()
             raise SystemExit(3)
+        except Exception as error:
+            try:
+                self._finalize_latent_fault(error)
+            except Exception:
+                logger.exception("Could not persist latent-fault abort evidence")
+            raise
+
+    def _finalize_latent_fault(self, error=None):
+        context = getattr(self, "_crash_context", {})
+        runtime = context.get("latent_runtime")
+        path = context.get("latent_summary_path")
+        if path is None:
+            return
+        if runtime is not None and runtime.finished_summary is None:
+            evidence = {} if error is None else {
+                "error_type": type(error).__name__, "error_message": str(error)}
+            context["latent_summaries"].append(runtime.finish_episode(
+                termination_reason="exception" if error is not None else "run_ended", **evidence))
+        if runtime is not None:
+            for event in runtime.drain_events():
+                context["fault_recorder"].record(event)
+                recorder = context.get("trajectory_recorder")
+                if recorder is not None:
+                    recorder.record(event)
+                    recorder._append_text(event["episode_id"],
+                        "Fault: " + json.dumps(event, ensure_ascii=False) + "\n")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"fault": runtime.spec.name if runtime is not None else None,
+                                   "episodes": context["latent_summaries"]},
+                                  ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _record_system_crash(self, error, writer, step_id):
         context = self._crash_context
@@ -118,13 +151,20 @@ class HabitatMASEvaluator(Evaluator):
         hang_spec = AgentHangFaultSpec.from_config(agent_hang_fault)
         dropout_spec.validate()
         hang_spec.validate()
+        latent_spec = read_latent_spec(config.habitat_baselines.fault_injection)
         if dropout_spec.enabled and hang_spec.enabled:
             raise FaultInjectionError(
                 "agent_dropout and agent_hang cannot both be enabled"
             )
         use_hang = hang_spec.enabled
-        fault_spec = hang_spec if use_hang else dropout_spec
-        fault_name = "agent_hang" if use_hang else "agent_dropout"
+        if latent_spec is not None and (dropout_spec.enabled or hang_spec.enabled):
+            raise FaultInjectionError("Only one fault can be enabled per run")
+        if latent_spec is not None and config.habitat_baselines.num_environments != 1:
+            raise FaultInjectionError("Latent faults require one environment")
+        fault_spec = latent_spec or (hang_spec if use_hang else dropout_spec)
+        fault_name = latent_spec.name if latent_spec else ("agent_hang" if use_hang else "agent_dropout")
+        latent = None
+        latent_summaries = []
         record_trajectory = config.habitat_baselines.trajectory.enabled
         output_dir = config.habitat_baselines.output_dir
         run_label = config.habitat_baselines.run_label
@@ -156,7 +196,7 @@ class HabitatMASEvaluator(Evaluator):
             AgentHangEventRecorder if use_hang else AgentDropoutEventRecorder
         )
         fault_recorder = (
-            recorder_type(output_dir, run_label)
+            recorder_type(output_dir, run_label, **({"fault_name": fault_name} if latent_spec else {}))
             if fault_spec.enabled
             else None
         )
@@ -177,7 +217,7 @@ class HabitatMASEvaluator(Evaluator):
             ),
             record_event=trajectory_recorder.record_recovery_event if trajectory_recorder is not None else None,
         ) if recovery_enabled else None
-        if trajectory_recorder is not None or detector is not None:
+        if trajectory_recorder is not None or detector is not None or latent_spec is not None:
             envs.call(
                 ["set_task_dynamic_state_capture"] * envs.num_envs,
                 [{"enabled": True} for _ in range(envs.num_envs)],
@@ -282,6 +322,9 @@ class HabitatMASEvaluator(Evaluator):
             "report_path": Path(output_dir) / (
                 output_run_stem(run_label, fault_name if fault_spec.enabled else "clean") + "_crash.json"
             ),
+            "latent_runtime": None, "latent_summaries": latent_summaries,
+            "latent_summary_path": (Path(output_dir) / (output_run_stem(run_label, fault_name) + "_summary.json")
+                                    if latent_spec is not None else None),
         }
         agent.eval()
         cur_ep_id = -1
@@ -313,6 +356,12 @@ class HabitatMASEvaluator(Evaluator):
                 for i in range(envs.num_envs):
                     # also add the debug/ logging info to the text context for convenience
                     envs_text_context[i]['episode_id'] = current_episodes_info[i].episode_id
+                    if latent_spec is not None:
+                        ep = current_episodes_info[i]
+                        entities = envs.call(["get_task_fault_context"])[0]["entities"] if latent_spec.name in (
+                            "wrong_subgoal", "object_localization") else None
+                        latent = LatentFaultRuntime(latent_spec, ep.scene_id, ep.episode_id, entities)
+                        self._crash_context["latent_runtime"] = latent
                     if detector is not None:
                         ep = current_episodes_info[i]
                         detector.reset(ep.scene_id, ep.episode_id, config.habitat.simulator.agents.keys())
@@ -359,6 +408,9 @@ class HabitatMASEvaluator(Evaluator):
                     envs_text_context=envs_text_context,
                     agent_dropout_fault=agent_dropout_fault,
                     agent_hang_fault=agent_hang_fault,
+                    latent_fault_runtime=latent,
+                    set_localization_fault=lambda **values: envs.call(
+                        ["set_task_localization_fault"], [values])[0],
                     simulator_steps=simulator_steps,
                     trajectory_replay=replay,
                     replay_row=replay_row,
@@ -389,6 +441,9 @@ class HabitatMASEvaluator(Evaluator):
                     for key, value in policy_info.items():
                         if key.endswith(("_dropout_event", "_hang_event")):
                             fault_recorder.record(value)
+                        elif key.endswith("_fault_events"):
+                            for event in value:
+                                fault_recorder.record(event)
 
             # NB: Move actions to CPU.  If CUDA tensors are
             # sent in to env.step(), that will create CUDA contexts
@@ -427,6 +482,18 @@ class HabitatMASEvaluator(Evaluator):
             dynamic_state_snapshots = [
                 info.pop("_dynamic_state_snapshot", None) for info in infos
             ]
+            if latent is not None:
+                latent.record_simulator_events((dynamic_state_snapshots[0] or {}).get("fault_events", []))
+                if dones[0]:
+                    latent_summaries.append(latent.finish_episode())
+                events = latent.drain_events()
+                if events:
+                    if action_data.policy_info is None:
+                        action_data.policy_info = [{}]
+                    key = latent.spec.agent + "_fault_events"
+                    action_data.policy_info[0].setdefault(key, []).extend(events)
+                    for event in events:
+                        fault_recorder.record(event)
             if detector is not None:
                 ep = current_episodes_info[0]
                 self._crash_context.update(
@@ -691,6 +758,10 @@ class HabitatMASEvaluator(Evaluator):
                 ]
 
         pbar.close()
+        if latent_spec is not None:
+            self._finalize_latent_fault()
+            if not any(event["triggered"] for event in latent_summaries):
+                raise FaultInjectionError(f"evaluation completed without triggering the configured {fault_name}")
         if fault_recorder is not None:
             scheduled_episode_ids = set(
                 fault_spec.simulator_step_schedule_map()
@@ -708,6 +779,9 @@ class HabitatMASEvaluator(Evaluator):
             missing_episode_ids = (
                 scheduled_episode_ids - fault_recorder.episode_ids
             )
+            if latent_spec is not None:
+                missing_episode_ids = scheduled_episode_ids - {
+                    event["episode_id"] for event in latent_summaries if event["triggered"]}
             if missing_episode_ids:
                 raise FaultInjectionError(
                     f"evaluation did not trigger scheduled {fault_name} for "

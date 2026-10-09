@@ -264,6 +264,13 @@ class RearrangeTask(NavigationTask):
 
     @add_perf_timing_func()
     def reset(self, episode: Episode, fetch_observations: bool = True):
+        previous_fault = getattr(self, "_localization_fault", None) or getattr(self, "_localization_restored", None)
+        if previous_fault is not None:
+            self._clear_localization_cache(previous_fault["agent_index"])
+        self._localization_fault = None
+        self._localization_restored = None
+        self._localization_events = []
+        self._localization_scene_description = None
         self._episode_id = episode.episode_id
         self._sim.offline_agent_ids = frozenset()
         self._ignore_collisions = []
@@ -430,7 +437,7 @@ class RearrangeTask(NavigationTask):
     def get_n_targets(self) -> int:
         return self.n_objs
 
-    def get_task_text_context(self) -> dict:
+    def get_task_text_context(self, agent=None, position_estimates=None) -> dict:
         current_episode_idx = self._sim.ep_info.episode_id
 
         if not self._robot_config or current_episode_idx not in self._robot_config:
@@ -460,7 +467,91 @@ class RearrangeTask(NavigationTask):
         else:   
             assert "agents" in self._robot_config[current_episode_idx]
             robot_config = self._robot_config[current_episode_idx]["agents"]
-        return get_text_context(self._sim, robot_config)
+        estimates = dict(position_estimates or {})
+        fault = getattr(self, "_localization_fault", None)
+        if fault is not None and agent == fault["agent"]:
+            entity = self.pddl_problem.get_entity(fault["entity"])
+            true_pos = np.array(self.pddl_problem.sim_info.get_entity_pos(entity), copy=True)
+            estimates[fault["entity"]] = (true_pos + np.array(fault["offset"])).tolist()
+        return get_text_context(self._sim, robot_config, position_estimates=estimates)
+
+    def get_fault_context(self):
+        return {"entities": [entity.name for entity in self.pddl_problem.get_ordered_entities_list()]}
+
+    def _clear_localization_cache(self, agent_index):
+        for action in self.actions.values():
+            if getattr(action, "_agent_index", None) == agent_index and hasattr(action, "_targets"):
+                action._targets.clear()
+                if hasattr(action, "prev_nav_done"):
+                    action.prev_nav_done = False
+                    action.prev_match_target_id = None
+                if hasattr(action, "skill_done"):
+                    action.skill_done = False
+
+    def set_localization_fault(self, agent, entity, offset, fault_id, simulator_step):
+        """Change one agent's estimate, preserving physical/PDDL ground truth."""
+        from habitat_mas.fault_injection.latent import ObjectLocalizationFaultSpec
+        from habitat_mas.fault_injection.agent_dropout import FaultInjectionError
+
+        names = list(self._sim.agents_mgr.agent_names)
+        if agent not in names or self.pddl_problem.get_entity(entity) is None:
+            raise FaultInjectionError("object_localization references an unknown agent or entity")
+        previous = getattr(self, "_localization_fault", None)
+        if offset is None:
+            if previous is not None:
+                self._clear_localization_cache(previous["agent_index"])
+                self._localization_fault = None
+                self._localization_restored = dict(previous)
+                true_position = self.pddl_problem.sim_info.get_entity_pos(
+                    self.pddl_problem.get_entity(previous["entity"]))
+                # Supersede the biased XYZ retained in model history, even when
+                # the next high-level decision occurs after the expiry step.
+                self._localization_scene_description = self.get_task_text_context(
+                    agent=agent, position_estimates={previous["entity"]: np.asarray(true_position).tolist()}
+                )["scene_description"]
+            self._localization_fault = None
+            restored = getattr(self, "_localization_restored", None)
+            if restored is not None:
+                restored["simulator_step"] = int(simulator_step)
+            return {"scene_description": getattr(self, "_localization_scene_description", None)}
+        spec = ObjectLocalizationFaultSpec(enabled=True, agent=agent, object=entity,
+                                           position_offset=tuple(offset), fault_id=fault_id)
+        spec.validate()
+        changed = previous is None or any(previous[key] != value for key, value in (
+            ("agent", agent), ("entity", entity), ("offset", list(offset)), ("fault_id", fault_id)))
+        if changed:
+            if previous is not None:
+                self._clear_localization_cache(previous["agent_index"])
+            self._clear_localization_cache(names.index(agent))
+        self._localization_fault = {"agent": agent, "agent_index": names.index(agent), "entity": entity,
+                                    "offset": list(offset), "fault_id": fault_id,
+                                    "simulator_step": int(simulator_step), "spec": spec}
+        self._localization_restored = None
+        if not hasattr(self, "_localization_events"):
+            self._localization_events = []
+        if changed:
+            self._localization_scene_description = self.get_task_text_context(agent=agent)["scene_description"]
+        return {"scene_description": self._localization_scene_description}
+
+    def get_navigation_entity_position(self, agent_index, entity):
+        position = np.array(self.pddl_problem.sim_info.get_entity_pos(entity), copy=True)
+        fault = getattr(self, "_localization_fault", None)
+        restored = getattr(self, "_localization_restored", None)
+        if fault is None and restored is not None and restored["agent_index"] == agent_index and restored["entity"] == entity.name:
+            self._localization_events.append(restored["spec"].event(
+                "localization_target_restored", self._sim.ep_info.scene_id, self._episode_id, restored["simulator_step"],
+                phase="NAVIGATION_TARGET_READ", object=entity.name,
+                true_position=position.tolist(), estimated_position=position.tolist()))
+        if fault is None or fault["agent_index"] != agent_index or fault["entity"] != entity.name:
+            return position
+        estimate = position + np.array(fault["offset"])
+        self._localization_events.append(fault["spec"].event(
+            "fault_applied", self._sim.ep_info.scene_id, self._episode_id, fault["simulator_step"],
+            phase="NAVIGATION_TARGET_READ", effect="biased_navigation_position", object=entity.name,
+            true_position=position.tolist(), estimated_position=estimate.tolist(),
+            position_offset=fault["offset"],
+        ))
+        return estimate
 
     def set_offline_agents(self, agents) -> None:
         """Apply logical dropout before goal evaluation, including recovery."""
@@ -581,11 +672,16 @@ class RearrangeTask(NavigationTask):
                 }
             )
 
-        return {
+        snapshot = {
             "timing": "post_env_step",
             "agents": agents,
             "objects": objects,
         }
+        events = getattr(self, "_localization_events", [])
+        if events:
+            snapshot["fault_events"] = list(events)
+            self._localization_events = []
+        return snapshot
 
     @property
     def should_end(self) -> bool:

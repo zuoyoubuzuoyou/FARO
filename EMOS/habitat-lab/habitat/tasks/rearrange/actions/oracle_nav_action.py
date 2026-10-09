@@ -140,9 +140,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
     def _get_target_for_idx(self, nav_to_target_idx: int):
         if nav_to_target_idx not in self._targets:
             nav_to_obj = self._poss_entities[nav_to_target_idx]
-            obj_pos = self._task.pddl_problem.sim_info.get_entity_pos(
-                nav_to_obj
-            )
+            obj_pos = self._task.get_navigation_entity_position(self._agent_index, nav_to_obj)
             start_pos, _, _ = place_agent_at_dist_from_pos(
                 np.array(obj_pos),
                 0.0,

@@ -126,6 +126,8 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             self.llm_agent.start_act = True
         else:
             get_next_action_message = step_action_prompt
+            if envs_text_context[0].get("refresh_scene_description", False):
+                get_next_action_message += '\nCurrent environment description:\n' + semantic_observation
 
         batch_size = masks.shape[0]
         next_skill = torch.zeros(batch_size)

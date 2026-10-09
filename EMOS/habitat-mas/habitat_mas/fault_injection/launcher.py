@@ -12,6 +12,7 @@ from typing import Any
 
 from habitat_mas.fault_injection.agent_dropout import AgentDropoutFaultSpec
 from habitat_mas.fault_injection.agent_hang import AgentHangFaultSpec
+from habitat_mas.fault_injection.latent import LATENT_SPECS
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,9 @@ FAULTS = {
         aliases=("hang",),
     ),
 }
+FAULTS.update({cls.name: FaultDefinition(
+    "habitat_baselines.fault_injection." + cls.config_path, cls,
+) for cls in LATENT_SPECS})
 
 
 def normalize_fault(value: str) -> str:
@@ -169,12 +173,13 @@ def make_schedule(
 
 
 def fault_overrides(
-    fault: str, agent: str, schedule: dict[str, int],
+    fault: str, agent: str, schedule: dict[str, int], parameters: dict | None = None,
 ) -> list[str]:
     definition = FAULTS[fault]
     encoded = ";".join(f"{episode}@{step}" for episode, step in schedule.items())
     definition.spec_type.from_config({
         "enabled": True, "agent": agent, "simulator_step_schedule": encoded,
+        **(parameters or {}),
     }).validate()
     # JSON quoted strings are Hydra values, not shell quoting. The launcher
     # passes each argument directly to subprocess without invoking a shell.
@@ -187,4 +192,5 @@ def fault_overrides(
         f"{prefix}.simulator_step_schedule={json.dumps(encoded)}",
     ])
     values.extend(f"{prefix}.{setting}" for setting in definition.overrides)
+    values.extend(f"{prefix}.{key}={json.dumps(value)}" for key, value in (parameters or {}).items())
     return values

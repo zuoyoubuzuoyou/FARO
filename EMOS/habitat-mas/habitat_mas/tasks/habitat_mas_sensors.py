@@ -47,7 +47,8 @@ class HSSDSceneDescriptionSensor(Sensor):
         sg.load_gt_scene_graph(self._sim)
         
         # Generate scene descriptions
-        objects_description = generate_objects_description(self._sim, sg.object_layer)
+        objects_description = generate_objects_description(
+            self._sim, sg.object_layer, position_estimates=kwargs.get("position_estimates"))
         agent_description = generate_agents_description(sg.agent_layer, sg.region_layer, sg.nav_mesh)
         
         scene_description = {
@@ -307,7 +308,7 @@ def get_text_context(sim, robot_configs: List[Dict], *args, **kwargs):
     text_sensors = get_text_sensors(sim, *args, **kwargs)
     text_context = {
         sensor_name: text_sensor.get_observation(
-            robot_configs=robot_configs
+            robot_configs=robot_configs, position_estimates=kwargs.get("position_estimates")
         ) 
         for sensor_name, text_sensor in text_sensors.items()
     }
@@ -325,4 +326,3 @@ if __name__ == "__main__":
     
     spot_robot_resume = robot_resume_sensor.get_robot_resume("SpotRobot")
     print(spot_robot_resume)
-    

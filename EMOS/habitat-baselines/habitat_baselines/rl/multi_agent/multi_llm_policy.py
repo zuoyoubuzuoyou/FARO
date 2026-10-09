@@ -3,6 +3,7 @@ import os
 import datetime
 import json
 import re
+import copy
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -619,6 +620,9 @@ class MultiLLMPolicy(MultiPolicy):
         replay = kwargs.get("trajectory_replay")
         replay_row = kwargs.get("replay_row")
         error_detector = kwargs.get("error_detector")
+        latent = kwargs.get("latent_fault_runtime")
+        if latent is not None and (dropout_spec.enabled or hang_spec.enabled):
+            raise FaultInjectionError("Only one fault can be enabled per run")
         AgentMessageBus.sent_messages.clear()
 
         text_goal = observations["pddl_text_goal"][0].tolist()
@@ -685,6 +689,18 @@ class MultiLLMPolicy(MultiPolicy):
         # Apply all faults before any agent executes or sends a request, so
         # same-step communication does not depend on agent dispatch order.
         AgentMessageBus.members = {f"agent_{i}" for i in range(n_agents)}
+        if latent is not None:
+            if latent.spec.agent not in AgentMessageBus.members:
+                raise FaultInjectionError(f"unknown {latent.spec.name}.agent: {latent.spec.agent}")
+            latent.begin_step(int(simulator_steps[0]))
+            if latent.spec.name == "object_localization":
+                result = kwargs["set_localization_fault"](
+                    agent=latent.spec.agent, entity=latent.spec.object,
+                    offset=list(latent.spec.position_offset) if latent.window.active else None,
+                    fault_id=latent.spec.fault_id or f"{latent.spec.name}_001",
+                    simulator_step=int(simulator_steps[0]),
+                )
+                latent.agent_scene_description = result["scene_description"]
         agent_fault_states = []
         for agent_i, policy in enumerate(self._active_policies):
             agent_i_handle = f"agent_{agent_i}"
@@ -874,10 +890,15 @@ class MultiLLMPolicy(MultiPolicy):
                         ),
                         chat_history=None,
                     )
+                if latent is not None and agent_i_handle == latent.spec.agent:
+                    args = copy.copy(args)
+                    args.subtask_description = latent.initial_assignment(args.subtask_description)
                 print(args)
                 episode_id = envs_text_context[0]["episode_id"]
                 episode_save_dir = os.path.join(save_chat_history_dir, str(episode_id))
                 logging_path = os.path.join(episode_save_dir, f"{agent_i_handle}_action_history.json")
+                if save_chat_history:
+                    os.makedirs(episode_save_dir, exist_ok=True)
                 
                 llm_policy.llm_agent.init_agent(
                     robot_type=args.robot_type,
@@ -886,9 +907,19 @@ class MultiLLMPolicy(MultiPolicy):
                     chat_history=args.chat_history,
                     enable_logging=save_chat_history,
                     logging_file=logging_path,
-                    **({"skip_planning": True} if replay is not None else {}),
+                    **({"skip_planning": True} if replay is not None and not (
+                        latent is not None and latent.spec.name == "wrong_subgoal" and latent.window.active
+                        and agent_i_handle == latent.spec.agent) else {}),
                 )
 
+            agent_text_context = envs_text_context
+            if latent is not None and agent_i_handle == latent.spec.agent:
+                latent.apply_planning(llm_policy.llm_agent, policy)
+                if latent.agent_scene_description is not None:
+                    agent_text_context = copy.deepcopy(envs_text_context)
+                    agent_text_context[0]["scene_description"] = latent.agent_scene_description
+                    # Subsequent high-level decisions need fresh localization input.
+                    agent_text_context[0]["refresh_scene_description"] = True
             # Run the policy
             agent_action = policy.act(
                 agent_obs,
@@ -896,7 +927,7 @@ class MultiLLMPolicy(MultiPolicy):
                 agent_prev_actions[agent_i],
                 agent_masks[agent_i],
                 deterministic,
-                envs_text_context=envs_text_context,
+                envs_text_context=agent_text_context,
                 agent_arguments=select_agent_arguments,
                 replay_row=replay_row,
             )
@@ -919,6 +950,17 @@ class MultiLLMPolicy(MultiPolicy):
                         agent_decision_steps[env_i] + 1
                     )
             agent_actions.append(agent_action)
+            if latent is not None:
+                latent.apply_action(agent_i_handle, agent_action, policy._high_level_policy._action_space)
+
+        if latent is not None:
+            latent.collect_messages()
+            events = latent.drain_events()
+            if events:
+                target = int(latent.spec.agent.removeprefix("agent_"))
+                if agent_actions[target].policy_info is None:
+                    agent_actions[target].policy_info = [{}]
+                agent_actions[target].policy_info[0]["fault_events"] = events
 
         any_agent_hung = any(
             info.get("hang_active", False)
