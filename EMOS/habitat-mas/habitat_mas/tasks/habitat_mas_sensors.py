@@ -140,10 +140,16 @@ class RobotResumeSensor(Sensor):
             agent_handle = f"agent_{agent_config['agent_idx']}"
             agent_type = agent_config["agent_type"]
             robot_resume_file = os.path.join(self.robot_resume_dir, f"{agent_type}.json")
-            if os.path.exists(robot_resume_file):
-                with open(robot_resume_file, "r") as f:
-                    robot_resume = json.load(f, parse_float=lambda x: round(float(x), 2))
-                    robot_resumes[agent_handle] = robot_resume
+            if not os.path.isfile(robot_resume_file):
+                raise FileNotFoundError(
+                    f"Missing robot resume for {agent_handle} "
+                    f"(agent_type={agent_type!r}): {robot_resume_file}. "
+                    "Check that habitat.dataset.robot_config matches the "
+                    "simulator agent configuration and its robot resume files."
+                )
+            with open(robot_resume_file, "r") as f:
+                robot_resume = json.load(f, parse_float=lambda x: round(float(x), 2))
+                robot_resumes[agent_handle] = robot_resume
         
         # convert dict to json string
         robot_resumes_str = json.dumps(robot_resumes)

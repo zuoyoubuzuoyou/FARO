@@ -101,7 +101,17 @@ class SceneGraphHSSD(SceneGraphBase):
                     target_pos = target.translation
                     target_rot = target.rotation
 
-                    goal_recep = rom.get_object_by_handle(goal_recep_handle)
+                    # Restored HSSD furniture may have a new runtime handle.
+                    runtime_handle = getattr(self.sim, "prev_recep", {}).get(
+                        "handle", {}
+                    ).get(goal_recep_handle, goal_recep_handle)
+                    goal_recep = rom.get_object_by_handle(runtime_handle)
+                    if goal_recep is None:
+                        raise ValueError(
+                            f"Episode {self.sim.ep_info.episode_id}: goal receptacle "
+                            f"{goal_recep_handle!r} (runtime handle {runtime_handle!r}) "
+                            f"not found in scene {self.sim.ep_info.scene_id!r}"
+                        )
                     abs_obj_id = goal_recep.object_id + self.sim.habitat_config.object_ids_start
                     self.object_layer.add_object(
                         target_pos,

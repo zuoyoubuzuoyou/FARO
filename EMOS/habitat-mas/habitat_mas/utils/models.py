@@ -189,9 +189,12 @@ class OpenAIModel:
             _wait_for_request_slot(self.max_requests_per_minute)
             try:
                 return self.client.chat.completions.create(**kwargs)
-            except openai.APIStatusError as error:
+            except (openai.APIConnectionError, openai.APIStatusError) as error:
                 status_code = getattr(error, "status_code", None)
-                retryable = status_code in {429, 503, 524}
+                # APITimeoutError is an APIConnectionError, with no HTTP status.
+                retryable = isinstance(
+                    error, openai.APIConnectionError
+                ) or status_code in {429, 503, 524}
                 if not retryable or retry_index >= self.max_retries:
                     raise
 
@@ -205,8 +208,13 @@ class OpenAIModel:
                         self.service_backoff_seconds * (2**retry_index),
                         self.max_service_backoff_seconds,
                     )
+                error_label = (
+                    f"HTTP {status_code}"
+                    if status_code is not None
+                    else type(error).__name__
+                )
                 print(
-                    f"[OpenAIModel] HTTP {status_code}; retry "
+                    f"[OpenAIModel] {error_label}; retry "
                     f"{retry_index + 1}/{self.max_retries} in "
                     f"{wait_seconds:.1f}s",
                     flush=True,
