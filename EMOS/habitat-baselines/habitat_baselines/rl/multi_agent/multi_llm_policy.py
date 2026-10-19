@@ -14,6 +14,7 @@ import torch
 from habitat_mas.agents.actions.discussion_actions import *
 from habitat_mas.utils import AgentArguments
 from habitat_mas.utils.models import OpenAIModel
+from habitat_mas.utils.trajectory import record_event
 
 from habitat_baselines.common.storage import Storage
 from habitat_baselines.common.tensor_dict import TensorDict
@@ -178,6 +179,7 @@ def get_full_capabilities(robot: dict):
 
 def parse_leader_response(text):
     # Define the regular expression pattern
+    raw_text = text
     text = text.replace("\n", "")
     pattern = r"\{(.*?)\|\|(.*?)\}"
 
@@ -188,11 +190,16 @@ def parse_leader_response(text):
     robot_tasks = {
         robot_id: subtask_description for robot_id, subtask_description in matches
     }
-
+    record_event(
+        "discussion_parse", agent_name="leader", phase="discussion",
+        parse_stage="task_assignment", raw_response=raw_text,
+        match_count=len(matches), parsed=robot_tasks,
+        used_fallback=False, handling="return_existing_parse_result",
+    )
     return robot_tasks
 
 
-def parse_agent_response(text):
+def parse_agent_response(text, agent_name=None):
     # Define the regular expression pattern
     pattern = r"\{(yes|no)(?:\|\|(.*?))?\}"
 
@@ -201,6 +208,12 @@ def parse_agent_response(text):
 
     if len(matches) == 0:
         print("No match found in agent response: ", text)
+        record_event(
+            "discussion_parse", agent_name=agent_name, phase="discussion",
+            parse_stage="agent_reflection", raw_response=text, match_count=0,
+            used_fallback=True, fallback_reason="no_response_pattern_match",
+            handling="return_existing_no_response", parsed=["no", text],
+        )
         return "no", text
     response, reason = matches[0]
     if response == "yes":
@@ -209,7 +222,12 @@ def parse_agent_response(text):
         reason = (
             reason.strip() if reason else ""
         )  # Store the reason, strip spaces, or empty if none
-
+    record_event(
+        "discussion_parse", agent_name=agent_name, phase="discussion",
+        parse_stage="agent_reflection", raw_response=text,
+        match_count=len(matches), parsed=[response, reason],
+        used_fallback=False, handling="return_existing_parse_result",
+    )
     return response, reason
 
 
@@ -355,7 +373,7 @@ def group_discussion(
             compute_path=compute_path,
         )
         response = robot_model.chat(robot_start_message)
-        agent_response[robot_id] = parse_agent_response(response)
+        agent_response[robot_id] = parse_agent_response(response, agent_name=robot_id)
         print("===============Robot Response==============")
         print(f"Robot {robot_id} response: {response}")
         print("===========================================")
@@ -392,7 +410,7 @@ def group_discussion(
                 compute_path=compute_path,
             )
             response = robot_model.chat(robot_start_message)
-            agent_response[robot_id] = parse_agent_response(response)
+            agent_response[robot_id] = parse_agent_response(response, agent_name=robot_id)
             print("===============Robot Response==============")
             print(f"Robot {robot_id} response: {response}")
             print("===========================================")
@@ -540,6 +558,13 @@ class MultiLLMPolicy(MultiPolicy):
                     save_chat_history_dir=save_chat_history_dir,
                     episode_id=episode_id,
                 )
+                for robot_id, assignment in agent_arguments.items():
+                    record_event(
+                        "task_assignment", agent_name=robot_id,
+                        robot_type=assignment.robot_type,
+                        task_description=assignment.task_description,
+                        subtask_description=assignment.subtask_description,
+                    )
                 envs_agent_arguments.append(agent_arguments)
                 
                 # Invalidate all action policies and flag them to be reinitialized
@@ -602,6 +627,12 @@ class MultiLLMPolicy(MultiPolicy):
                     should_terminate = False
                     break
             if should_terminate:
+                record_event(
+                    "termination_request", source="multi_llm_policy",
+                    reason="all_agents_waiting",
+                    handling="existing_stop_action_assignment",
+                    agent_skill_ids=[action.skill_id for action in agent_actions],
+                )
                 print("=================Terminate=================")
                 print("All agents are waiting for next action.")
                 print("===========================================")

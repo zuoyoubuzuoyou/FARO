@@ -45,6 +45,9 @@ class EvalConfig(HabitatBaselinesBaseConfig):
     # The number of time to run each episode through evaluation.
     # Only works when evaluating on all episodes.
     evals_per_ep: int = 1
+    # Structured MAS evaluation traces, one JSONL stream per episode attempt.
+    save_trajectories: bool = True
+    trajectory_dir: str = "runs"
     video_option: List[str] = field(
         # available options are "disk" and "tensorboard"
         default_factory=list

@@ -14,6 +14,7 @@ from habitat_baselines.common.logging import baselines_logger
 from habitat_baselines.rl.hrl.utils import find_action_range
 from habitat_baselines.rl.ppo.policy import Policy, PolicyActionData
 from habitat_baselines.utils.common import get_num_actions
+from habitat_mas.utils.trajectory import current_action_id, record_event
 
 
 class SkillPolicy(Policy):
@@ -184,6 +185,12 @@ class SkillPolicy(Policy):
         assert is_skill_done.shape == (
             len(batch_idx),
         ), f"Must return tensor of shape (batch_size,) but got tensor of shape {is_skill_done.shape}"
+        trajectory_agent_id = getattr(self, "_trajectory_agent_id", None)
+        tracing = (trajectory_agent_id is not None and
+                   current_action_id(trajectory_agent_id) is not None)
+        # Preserve the controller's actual signal before existing timeout and
+        # high-level termination logic combines it in place.
+        raw_is_skill_done = is_skill_done.clone() if tracing else None
 
         cur_skill_step = self._cur_skill_step[batch_idx]
 
@@ -208,6 +215,23 @@ class SkillPolicy(Policy):
                 )
         # Also terminate the skill if the HL policy wanted termination.
         is_skill_done |= hl_wants_skill_term
+
+        if tracing:
+            for index, env_index in enumerate(batch_idx):
+                record_event(
+                    "skill_termination_signal", agent_id=trajectory_agent_id,
+                    skill_name=skill_name[index], batch_index=env_index,
+                    is_skill_done=bool(raw_is_skill_done[index]),
+                    cur_skill_step=float(cur_skill_step[index]),
+                    max_skill_steps=self._max_skill_steps,
+                    force_end_on_timeout=self._force_end_on_timeout,
+                    over_max_len=(bool(over_max_len[index])
+                                  if self._max_skill_steps > 0 else False),
+                    high_level_interrupt=bool(hl_wants_skill_term[index]),
+                    call_high_level=bool(is_skill_done[index]),
+                    bad_terminate=bool(bad_terminate[index]),
+                    termination_actions=new_actions[index],
+                )
 
         return is_skill_done, bad_terminate, new_actions
 

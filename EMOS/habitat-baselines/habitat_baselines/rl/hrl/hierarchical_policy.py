@@ -3,6 +3,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os.path as osp
+import traceback
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,12 @@ from habitat_baselines.rl.hrl.skills import NoopSkillPolicy, SkillPolicy
 from habitat_baselines.rl.hrl.utils import find_action_range
 from habitat_baselines.rl.ppo.policy import Policy, PolicyActionData
 from habitat_baselines.utils.common import get_num_actions
+from habitat_mas.utils.trajectory import (
+    begin_action,
+    current_action_id,
+    end_action,
+    record_event,
+)
 
 
 @baseline_registry.register_policy
@@ -52,6 +59,8 @@ class HierarchicalPolicy(nn.Module, Policy):
         Policy.__init__(self, action_space)
         nn.Module.__init__(self)
         self._num_envs: int = num_envs
+        # Recording identity never participates in policy or skill selection.
+        self._trajectory_agent_id = agent_name or "agent_0"
 
         # Maps (skill idx -> skill)
         self._skills: Dict[int, SkillPolicy] = {}
@@ -140,6 +149,7 @@ class HierarchicalPolicy(nn.Module, Policy):
                 full_config,
             )
             skill_policy.set_pddl_problem(self._pddl)
+            skill_policy._trajectory_agent_id = self._trajectory_agent_id
             if skill_config.pddl_action_names is None:
                 action_names = [skill_name]
             else:
@@ -338,13 +348,25 @@ class HierarchicalPolicy(nn.Module, Policy):
             },
         )
         for skill_id, (batch_ids, batch_dat) in grouped_skills.items():
-            action_data = self._skills[skill_id].act(
-                observations=batch_dat["observations"],
-                rnn_hidden_states=batch_dat["rnn_hidden_states"],
-                prev_actions=batch_dat["prev_actions"],
-                masks=batch_dat["masks"],
-                cur_batch_idx=batch_ids,
-            )
+            try:
+                action_data = self._skills[skill_id].act(
+                    observations=batch_dat["observations"],
+                    rnn_hidden_states=batch_dat["rnn_hidden_states"],
+                    prev_actions=batch_dat["prev_actions"],
+                    masks=batch_dat["masks"],
+                    cur_batch_idx=batch_ids,
+                )
+            except Exception as error:
+                self._trajectory_execution_error("act", batch_ids, error)
+                raise
+            if current_action_id(self._trajectory_agent_id) is not None:
+                for local_index, batch_index in enumerate(batch_ids):
+                    record_event(
+                        "skill_action", agent_id=self._trajectory_agent_id,
+                        skill_name=self._idx_to_name[self._cur_skills[batch_index]],
+                        batch_index=batch_index,
+                        actions=action_data.actions[local_index],
+                    )
             actions[batch_ids] += action_data.actions
 
             if self._has_ll_hidden_state:
@@ -487,19 +509,29 @@ class HierarchicalPolicy(nn.Module, Policy):
             )
 
             for skill_id, (batch_ids, _) in sel_grouped_skills.items():
-                (
-                    ll_rnn_hidden_states_batched,
-                    prev_actions_batched,
-                ) = self._skills[skill_id].on_enter(
-                    [new_skill_args[i] for i in batch_ids],
-                    batch_ids,
-                    observations,
-                    ll_rnn_hidden_states,
-                    prev_actions,
-                    skill_name=[
-                        self._idx_to_name[new_skills[i]] for i in batch_ids
-                    ],
-                )
+                try:
+                    (
+                        ll_rnn_hidden_states_batched,
+                        prev_actions_batched,
+                    ) = self._skills[skill_id].on_enter(
+                        [new_skill_args[i] for i in batch_ids],
+                        batch_ids,
+                        observations,
+                        ll_rnn_hidden_states,
+                        prev_actions,
+                        skill_name=[
+                            self._idx_to_name[new_skills[i]] for i in batch_ids
+                        ],
+                    )
+                except Exception as error:
+                    self._trajectory_execution_error("on_enter", batch_ids, error)
+                    raise
+                for batch_index in batch_ids:
+                    begin_action(
+                        self._trajectory_agent_id,
+                        self._idx_to_name[new_skills[batch_index]],
+                        new_skill_args[batch_index], batch_index=batch_index,
+                    )
 
                 if self._has_ll_hidden_state:
                     ll_rnn_hidden_states = _write_tensor_batched(
@@ -556,14 +588,18 @@ class HierarchicalPolicy(nn.Module, Policy):
           condition).
         """
 
-        hl_wants_skill_term = self._high_level_policy.get_termination(
-            observations,
-            hl_rnn_hidden_states,
-            prev_actions,
-            masks,
-            self._cur_skills,
-            log_info,
-        )
+        try:
+            hl_wants_skill_term = self._high_level_policy.get_termination(
+                observations,
+                hl_rnn_hidden_states,
+                prev_actions,
+                masks,
+                self._cur_skills,
+                log_info,
+            )
+        except Exception as error:
+            self._trajectory_execution_error("high_level_termination", range(masks.shape[0]), error)
+            raise
 
         # Check if skills should terminate.
         batch_size = masks.shape[0]
@@ -582,18 +618,48 @@ class HierarchicalPolicy(nn.Module, Policy):
             },
         )
         for skill_id, (batch_ids, dat) in grouped_skills.items():
-            (
-                call_hl_batch,
-                bad_should_terminate_batch,
-                new_actions,
-            ) = self._skills[skill_id].should_terminate(
-                **dat,
-                batch_idx=batch_ids,
-                log_info=log_info,
-                skill_name=[
-                    self._idx_to_name[self._cur_skills[i]] for i in batch_ids
-                ],
-            )
+            skill = self._skills[skill_id]
+            try:
+                (
+                    call_hl_batch,
+                    bad_should_terminate_batch,
+                    new_actions,
+                ) = skill.should_terminate(
+                    **dat,
+                    batch_idx=batch_ids,
+                    log_info=log_info,
+                    skill_name=[
+                        self._idx_to_name[self._cur_skills[i]] for i in batch_ids
+                    ],
+                )
+            except Exception as error:
+                self._trajectory_execution_error("should_terminate", batch_ids, error)
+                raise
+            if current_action_id(self._trajectory_agent_id) is not None:
+                for local_index, batch_index in enumerate(batch_ids):
+                    if not (call_hl_batch[local_index] or bad_should_terminate_batch[local_index]):
+                        continue
+                    max_steps = getattr(skill, "_max_skill_steps", None)
+                    cur_steps = getattr(skill, "_cur_skill_step", None)
+                    cur_step = None if cur_steps is None else float(cur_steps[batch_index])
+                    timed_out = max_steps is not None and max_steps > 0 and cur_step is not None and cur_step >= max_steps
+                    interrupted = bool(dat["hl_wants_skill_term"][local_index])
+                    reason = ("max_skill_steps" if timed_out else
+                              "high_level_interrupt" if interrupted else "skill_done_signal")
+                    end_action(
+                        self._trajectory_agent_id,
+                        status="timeout" if timed_out else "controller_terminated",
+                        reason=reason,
+                        result={
+                            "call_high_level": bool(call_hl_batch[local_index]),
+                            "bad_terminate": bool(bad_should_terminate_batch[local_index]),
+                            "high_level_interrupt": interrupted,
+                            "cur_skill_step": cur_step,
+                            "max_skill_steps": max_steps,
+                            "force_end_on_timeout": getattr(skill, "_force_end_on_timeout", None),
+                        },
+                        defer=True,
+                    )
 
             self._cur_call_high_level = _write_tensor_batched(
                 self._cur_call_high_level, call_hl_batch, batch_ids
@@ -603,6 +669,14 @@ class HierarchicalPolicy(nn.Module, Policy):
             )
             actions[batch_ids] += new_actions
         return self._cur_call_high_level, bad_should_terminate, actions
+
+    def _trajectory_execution_error(self, stage, batch_ids, error):
+        record_event(
+            "execution_error", agent_id=self._trajectory_agent_id,
+            stage=stage, batch_indices=list(batch_ids),
+            error={"type": type(error).__name__, "message": str(error),
+                   "traceback": traceback.format_exc()},
+        )
 
     def get_value(self, observations, rnn_hidden_states, prev_actions, masks):
         return self._high_level_policy.get_value(

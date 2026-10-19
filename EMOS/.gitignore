@@ -97,6 +97,8 @@ data
 /tb
 *.mp4
 /chat_history_output/
+/trajectory_output/
+/runs/
 
 # outputs from other libraries
 /sandbox
@@ -106,5 +108,6 @@ video_dir/**
 *.ply
 debug/
 # Local experiment outputs and backups
+/analysis_results/
 episode_log/
 *.bak

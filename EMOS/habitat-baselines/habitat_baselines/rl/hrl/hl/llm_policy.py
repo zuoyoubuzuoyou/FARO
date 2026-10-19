@@ -14,6 +14,7 @@ from habitat_mas.agents.dummy_agent import DummyAgent
 from habitat_baselines.rl.hrl.hl.high_level_policy import HighLevelPolicy
 from habitat_baselines.rl.ppo.policy import PolicyActionData
 from habitat_mas.utils import AgentArguments
+from habitat_mas.utils.trajectory import record_event
 
 ACTION_POOL = [send_request, nav_to_obj, pick, place, reset_arm, wait]
 
@@ -144,10 +145,32 @@ class LLMHighLevelPolicy(HighLevelPolicy):
             if llm_output is None:
                 next_skill[batch_idx] = self._skill_name_to_idx["wait"]
                 skill_args_data[batch_idx] = ["500"]
+                record_event(
+                    "skill_selection", agent_name=self.llm_agent.name,
+                    phase="execution", llm_output=llm_output,
+                    skill_name="wait", skill_args=skill_args_data[batch_idx],
+                    fallback_reason="llm_output_none", handling="existing_wait",
+                    batch_index=batch_idx,
+                )
                 continue
 
-            action_name = llm_output["name"]
-            action_args = self._parse_function_call_args(action_name, llm_output["arguments"])
+            try:
+                action_name = llm_output["name"]
+                action_args = self._parse_function_call_args(action_name, llm_output["arguments"])
+            except Exception as error:
+                record_event(
+                    "skill_parse", agent_name=self.llm_agent.name,
+                    phase="execution", llm_output=llm_output, batch_index=batch_idx,
+                    status="error", handling="rethrow",
+                    error_type=type(error).__name__, error_message=str(error),
+                )
+                raise
+            record_event(
+                "skill_parse", agent_name=self.llm_agent.name, phase="execution",
+                llm_output=llm_output, action_name=action_name,
+                parsed_arguments=action_args, batch_index=batch_idx,
+                status="success", handling="continue",
+            )
 
             if action_name in self._skill_name_to_idx:
                 next_skill[batch_idx] = self._skill_name_to_idx[action_name]
@@ -156,6 +179,22 @@ class LLMHighLevelPolicy(HighLevelPolicy):
                 # If the action is not valid, do nothing
                 next_skill[batch_idx] = self._skill_name_to_idx["wait"]
                 skill_args_data[batch_idx] = ["500"]
+            record_event(
+                "skill_selection", agent_name=self.llm_agent.name,
+                phase="execution", llm_output=llm_output,
+                skill_name=(
+                    action_name if action_name in self._skill_name_to_idx else "wait"
+                ),
+                skill_args=skill_args_data[batch_idx],
+                requested_action_name=action_name, parsed_arguments=action_args,
+                fallback_reason=(
+                    None if action_name in self._skill_name_to_idx else "unknown_action"
+                ),
+                handling=(
+                    "selected_skill" if action_name in self._skill_name_to_idx else "existing_wait"
+                ),
+                batch_index=batch_idx,
+            )
 
         return (
             next_skill,

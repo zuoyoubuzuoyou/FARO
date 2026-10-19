@@ -2,6 +2,7 @@ from typing import List, Optional
 
 from .crab_core import Action
 from ..utils.models import OpenAIModel
+from ..utils.trajectory import decision_scope, record_event
 
 
 REQUEST_TEMPLATE = '"{source_agent}" agent sent you requests: "{request}".'
@@ -107,24 +108,66 @@ class CrabAgent:
         print(response)
 
     def chat(self, observation: str) -> Optional[dict]:
+        with decision_scope(self.name, phase="execution"):
+            return self._chat(observation)
+
+    def _record_action_output(self, output, transformation):
+        record_event(
+            "agent_action", agent_name=self.name, phase="execution",
+            output=output, transformation=transformation,
+        )
+        return output
+
+    def _chat(self, observation: str) -> Optional[dict]:
         if self.name in CrabAgent.message_pipe and CrabAgent.message_pipe[self.name]:
             prompt = " ".join(CrabAgent.message_pipe[self.name])
             observation = str(observation) + " " + prompt
+            for message in CrabAgent.message_pipe[self.name]:
+                # The pipe remains a list of the original rendered strings.
+                # Recover metadata from the exact existing request template.
+                source, separator, request = message.partition('" agent sent you requests: "')
+                recognized = bool(separator and source.startswith('"') and request.endswith('".'))
+                record_event(
+                    "communication_receive", agent_name=self.name,
+                    phase="execution", sender=source[1:] if recognized else None,
+                    recipient=self.name, message=request[:-2] if recognized else message,
+                    rendered_message=message, status="consumed",
+                    sender_source="request_template" if recognized else "unknown",
+                )
             CrabAgent.message_pipe[self.name] = []
 
         action_name, parameters = self.llm_model.chat(str(observation))
+        record_event(
+            "agent_tool_decision", agent_name=self.name, phase="execution",
+            action_name=action_name, parameters=parameters,
+        )
         if action_name == "send_request":
             target_agent = parameters["target_agent"]
             if target_agent == self.name:  # send request to itself
-                return None
+                record_event(
+                    "communication_send", agent_name=self.name,
+                    phase="execution", sender=self.name, recipient=target_agent,
+                    message=parameters.get("request"), status="suppressed",
+                    handling="return_none", reason="self_request",
+                )
+                return self._record_action_output(None, "self_request_suppressed")
             request = parameters["request"]
             if target_agent not in CrabAgent.message_pipe:
                 CrabAgent.message_pipe[target_agent] = []
             prompt = REQUEST_TEMPLATE.format(source_agent=self.name, request=request)
             CrabAgent.message_pipe[target_agent].append(prompt)
-            return {"name": "wait", "arguments": ["500"]}
+            record_event(
+                "communication_send", agent_name=self.name, phase="execution",
+                sender=self.name, recipient=target_agent, message=request,
+                rendered_message=prompt, status="queued", handling="existing_wait",
+            )
+            return self._record_action_output(
+                {"name": "wait", "arguments": ["500"]}, "send_request_to_wait",
+            )
         if action_name == "wait":
-            return {"name": "wait", "arguments": ["500"]}
+            return self._record_action_output(
+                {"name": "wait", "arguments": ["500"]}, "existing_wait_arguments",
+            )
         if action_name in [
             "nav_to_obj",
             "nav_to_goal",
@@ -133,9 +176,13 @@ class CrabAgent:
             "pick",
         ]:
             parameters["robot"] = self.name
-            return {"name": action_name, "arguments": parameters}
+            return self._record_action_output(
+                {"name": action_name, "arguments": parameters}, "inject_robot_argument",
+            )
         else:
-            return {"name": action_name, "arguments": parameters}
+            return self._record_action_output(
+                {"name": action_name, "arguments": parameters}, "identity",
+            )
 
 def _generate_action_prompt(action_space: list[Action], include_arguments: bool = False) -> str:
     if include_arguments:

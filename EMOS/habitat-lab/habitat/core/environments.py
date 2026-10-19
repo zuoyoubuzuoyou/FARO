@@ -59,11 +59,27 @@ class RLTaskEnv(habitat.RLEnv):
     def reset(
         self, *args, return_info: bool = False, **kwargs
     ) -> Union[RLTaskEnvObsType, Tuple[RLTaskEnvObsType, Dict]]:
+        if getattr(self, "_trajectory_recording_enabled", False):
+            self._trajectory_executed_action = None
+            self.__dict__.pop("_trajectory_executed_action_error", None)
         return super().reset(*args, return_info=return_info, **kwargs)
 
     def step(
         self, *args, **kwargs
     ) -> Tuple[RLTaskEnvObsType, float, bool, dict]:
+        if getattr(self, "_trajectory_recording_enabled", False):
+            # HabGymWrapper has already converted the policy vector into the
+            # Habitat action dictionary at this boundary. Detach before the
+            # simulator consumes it, since actions can contain mutable arrays.
+            action = args[0] if args else kwargs.get("action")
+            self.__dict__.pop("_trajectory_executed_action_error", None)
+            try:
+                self._trajectory_executed_action = self._trajectory_value(action)
+            except Exception as error:
+                self._trajectory_executed_action = None
+                self._trajectory_executed_action_error = (
+                    f"action_copy_failed: {type(error).__name__}: {error}"
+                )
         return super().step(*args, **kwargs)
 
     def get_reward_range(self):
@@ -93,7 +109,235 @@ class RLTaskEnv(habitat.RLEnv):
         return done
 
     def get_info(self, observations):
-        return self._env.get_metrics()
+        metrics = self._env.get_metrics()
+        if not getattr(self, "_trajectory_recording_enabled", False):
+            return metrics
+        info = dict(metrics)
+        try:
+            info["__trajectory_state"] = self.get_trajectory_state()
+        except Exception as error:
+            # Observation-only failures must not interrupt the real step or
+            # replace its reward, done flag, metrics, or original exception.
+            info["__trajectory_state"] = None
+            info["__trajectory_state_error"] = {
+                "type": type(error).__name__, "message": str(error),
+                "handling": "continue_without_snapshot",
+            }
+        return info
+
+    def set_trajectory_recording(self, enabled: bool) -> None:
+        """Opt in to simulator snapshots in step info, before vector auto-reset."""
+        self._trajectory_recording_enabled = bool(enabled)
+        if not enabled:
+            self.__dict__.pop("_trajectory_executed_action", None)
+            self.__dict__.pop("_trajectory_executed_action_error", None)
+
+    @staticmethod
+    def _trajectory_value(value):
+        """Detach action values without retaining simulator or tensor objects."""
+        import math
+        from collections.abc import Mapping
+
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, Mapping):
+            return {str(key): RLTaskEnv._trajectory_value(item)
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [RLTaskEnv._trajectory_value(item) for item in value]
+        for method_name in ("detach", "cpu"):
+            method = getattr(value, method_name, None)
+            if callable(method):
+                value = method()
+        for method_name in ("tolist", "item"):
+            method = getattr(value, method_name, None)
+            if callable(method):
+                return RLTaskEnv._trajectory_value(method())
+        return None
+
+    def _trajectory_targets(self, simulator, missing):
+        """Read rearrange targets using their relative scene-object indices."""
+        get_targets = getattr(simulator, "get_targets", None)
+        if not callable(get_targets):
+            missing["target_objects"] = "simulator_does_not_support_get_targets"
+            return None
+        try:
+            indices, goals = get_targets()
+        except Exception as error:
+            missing["target_objects"] = f"get_targets_failed: {type(error).__name__}: {error}"
+            return None
+        positions = None
+        get_positions = getattr(simulator, "get_scene_pos", None)
+        if callable(get_positions):
+            try:
+                positions = get_positions()
+            except Exception as error:
+                missing["target_objects.position"] = f"get_scene_pos_failed: {type(error).__name__}: {error}"
+        else:
+            missing["target_objects.position"] = "simulator_does_not_support_get_scene_pos"
+        object_ids = getattr(simulator, "scene_obj_ids", None)
+        if object_ids is None:
+            missing["target_objects.object_id"] = "simulator_does_not_expose_scene_obj_ids"
+        manager = None
+        get_manager = getattr(simulator, "get_rigid_object_manager", None)
+        if callable(get_manager):
+            try:
+                manager = get_manager()
+            except Exception as error:
+                missing["target_objects.handle"] = f"get_rigid_object_manager_failed: {type(error).__name__}: {error}"
+        else:
+            missing["target_objects.handle"] = "simulator_does_not_support_get_rigid_object_manager"
+        targets = []
+        for target_index, scene_index in enumerate(indices):
+            scene_index = int(scene_index)
+            target = {
+                "scene_index": scene_index,
+                "object_id": None,
+                "handle": None,
+                "position": None,
+                "goal_position": [float(value) for value in goals[target_index]],
+            }
+            try:
+                if positions is not None:
+                    target["position"] = [float(value) for value in positions[scene_index]]
+                if object_ids is not None:
+                    target["object_id"] = int(object_ids[scene_index])
+                if manager is not None and target["object_id"] is not None:
+                    obj = manager.get_object_by_id(target["object_id"])
+                    handle = getattr(obj, "handle", None)
+                    if handle is not None:
+                        target["handle"] = str(handle)
+                    else:
+                        missing[f"target_objects.{target_index}.handle"] = "rigid_object_has_no_handle"
+            except Exception as error:
+                missing[f"target_objects.{target_index}"] = f"object_state_failed: {type(error).__name__}: {error}"
+            targets.append(target)
+        return targets
+
+    def _trajectory_progress(self, missing):
+        """Keep small numeric task metrics, omitting map and image payloads."""
+        def copy_metric(value, path):
+            if isinstance(value, dict):
+                result = {}
+                for key, item in value.items():
+                    copied = copy_metric(item, f"{path}.{key}")
+                    if copied is not omit:
+                        result[str(key)] = copied
+                return result if result or not value else omit
+            shape = getattr(value, "shape", None)
+            if shape is not None and len(shape) > 0:
+                missing[path] = "nonscalar_metric_omitted"
+                return omit
+            if isinstance(value, (list, tuple)):
+                missing[path] = "nonscalar_metric_omitted"
+                return omit
+            copied = self._trajectory_value(value)
+            if copied is None and value is not None:
+                missing[path] = "unsupported_or_nonfinite_metric"
+            return copied
+
+        omit = object()
+        return copy_metric(self._env.get_metrics(), "task_progress")
+
+    def get_trajectory_state(self) -> dict:
+        """Return a detached, JSON-safe snapshot of the current simulator state.
+
+        Articulated poses come from robot bases rather than sensor agents.
+        All base rotations are quaternions in ``[x, y, z, w]`` order,
+        preserving the full orientation and the direction of rotation.
+        End-effector positions and grasped object IDs are null when absent.
+        """
+        simulator = self._env.sim
+        simulator_config = self.config.simulator
+        agents_manager = getattr(simulator, "agents_mgr", None)
+        missing = {}
+        agents = {}
+        for index, name in enumerate(simulator_config.agents_order):
+            agent_config = simulator_config.agents[name]
+            agent_state = {
+                "ee_position": None,
+                "grasped_object_id": None,
+            }
+            if agents_manager is not None:
+                agent_data = agents_manager[index]
+                robot = agent_data.articulated_agent
+                rotation = robot.sim_obj.rotation
+                agent_state.update(
+                    robot_type=str(
+                        agent_config.articulated_agent_type
+                        or type(robot).__name__
+                    ),
+                    base_position=[float(value) for value in robot.base_pos],
+                    base_rotation=[float(value) for value in rotation.vector]
+                    + [float(rotation.scalar)],
+                )
+                if robot.params.ee_links:
+                    agent_state["ee_position"] = [
+                        float(value)
+                        for value in robot.ee_transform().translation
+                    ]
+                else:
+                    missing[f"agents.{name}.ee_position"] = "robot_has_no_end_effector"
+                if agent_data.grasp_mgrs:
+                    object_id = agent_data.grasp_mgr.snap_idx
+                    if object_id is not None:
+                        agent_state["grasped_object_id"] = int(object_id)
+                else:
+                    missing[f"agents.{name}.grasped_object_id"] = "agent_has_no_grasp_manager"
+            else:
+                simulator_state = simulator.get_agent_state(index)
+                rotation = simulator_state.rotation
+                agent_state.update(
+                    robot_type=str(
+                        agent_config.articulated_agent_type
+                        or type(simulator).__name__
+                    ),
+                    base_position=[
+                        float(value) for value in simulator_state.position
+                    ],
+                    base_rotation=[
+                        float(rotation.x),
+                        float(rotation.y),
+                        float(rotation.z),
+                        float(rotation.w),
+                    ],
+                )
+                missing[f"agents.{name}.ee_position"] = "non_articulated_agent"
+                missing[f"agents.{name}.grasped_object_id"] = "non_articulated_agent"
+            agents[str(name)] = agent_state
+
+        episode_over = bool(self.get_done(None))
+        termination_reason = None
+        if episode_over:
+            if self._end_on_success and self._episode_success():
+                termination_reason = "success"
+            elif self._env._past_limit():
+                termination_reason = "time_limit"
+            else:
+                termination_reason = "task_inactive"
+        episode = self._env.current_episode
+        executed_action = getattr(self, "_trajectory_executed_action", None)
+        if executed_action is None:
+            missing["executed_action"] = getattr(
+                self, "_trajectory_executed_action_error",
+                "no_recorded_step_since_reset",
+            )
+        target_objects = self._trajectory_targets(simulator, missing)
+        task_progress = self._trajectory_progress(missing)
+        return {
+            "episode_id": str(episode.episode_id),
+            "scene_id": str(episode.scene_id),
+            "num_steps": int(self._env._elapsed_steps),
+            "agents": agents,
+            "episode_over": episode_over,
+            "termination_reason": termination_reason,
+            "executed_action": self._trajectory_value(executed_action),
+            "target_objects": target_objects,
+            "task_progress": task_progress,
+            "missing_fields": missing,
+        }
 
     def get_task_text_context(self) -> dict:
         """
