@@ -353,6 +353,21 @@ Validation: `scripts/trajectory_smoke.py`, `test/test_trajectory_recorder.py`,
 `test/test_llm_trajectory.py`, `test/test_execution_trajectory.py`,
 `test/test_trajectory_state.py` and `test/test_mas_trajectory_integration.py`.
 
+### System-error detection and episode-level evaluation
+
+The separate `habitat_mas.detection` package replays Perception, Mobility,
+Rearrange and Manipulation trajectories through team-progress heuristic rules
+and a structured LLM detector. A consecutive-action-name baseline is also
+provided. Detectors observe only current/past data and do not alter policies.
+
+Run `python scripts/evaluate_system_errors.py --help` from the EMOS root.
+The [Chinese workflow and annotation guide](../docs/system_error_detection.md)
+describes sampling units, all four batch selections, API request auditing,
+cache reuse and the independent human annotation CSV. Precision and recall
+are computed per episode against runtime-anomaly labels, including successful
+episodes; previous failure-attribution classes are not substituted for these
+labels. Unknown labels or incomplete inference keep formal metrics unavailable.
+
 ### Dataset Structure
 
 **Multi robot perception**

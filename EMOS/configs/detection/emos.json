@@ -1,0 +1,28 @@
+{
+  "datasets": [
+    {
+      "dataset": "rearrange_20261011_215201",
+      "task": "rearrange",
+      "manifest": "analysis_results/rearrange_20261011_215201/manual_review/manifest.json",
+      "expected_episodes": 49
+    },
+    {
+      "dataset": "mobility_20261012_152653",
+      "task": "mobility",
+      "manifest": "analysis_results/mobility_20261012_152653/manual_review/manifest.json",
+      "expected_episodes": 99
+    },
+    {
+      "dataset": "perception_hssd0_20261013_162242",
+      "task": "perception",
+      "manifest": "analysis_results/perception_hssd0_20261013_162242/manual_review/manifest.json",
+      "expected_episodes": 103
+    },
+    {
+      "dataset": "manipulation_20261015_092413_retry3",
+      "task": "manipulation",
+      "manifest": "analysis_results/manipulation_20261015_092413_retry3/manual_review/manifest.json",
+      "expected_episodes": 139
+    }
+  ]
+}
