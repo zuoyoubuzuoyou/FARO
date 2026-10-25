@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
+from copy import deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
@@ -401,6 +402,10 @@ class _EpisodeWriter:
                 action_name=payload.get("action_name"), parameters=payload.get("parameters"),
                 status="selected_not_entered",
             )
+        if self.owner.event_callback is not None:
+            # Callbacks only enqueue detached events; online work runs after
+            # the returned environment transition, outside logging hooks.
+            self.owner.event_callback(deepcopy(payload))
         return payload
 
     def begin_action(self, agent_id, name, parameters, step, **data):
@@ -533,7 +538,7 @@ class _EpisodeWriter:
 
 
 class EvaluationTrace:
-    def __init__(self, output_dir, metadata=None):
+    def __init__(self, output_dir, metadata=None, event_callback=None):
         missing = {}
         self.metadata = redact(_safe_value(metadata or {}, missing))
         if missing:
@@ -548,6 +553,7 @@ class EvaluationTrace:
         self._closed = False
         self._models = {}
         self._model_call_keys = {}
+        self.event_callback = event_callback
         self.config = {"schema_version": SCHEMA_VERSION, "run_id": self.run_id,
                        "timestamp": _timestamp(), "metadata": self.metadata, "models_used": [],
                        "episodes": [],

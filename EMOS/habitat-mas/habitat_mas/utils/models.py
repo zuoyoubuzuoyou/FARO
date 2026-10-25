@@ -24,7 +24,7 @@ class OpenAIModel:
         self,
         system_prompt: str,
         action_space: List[Action],
-        model="gpt-5.5",
+        model=None,
         window_size=None,
         discussion_stage=False,
         code_execution=False,
@@ -41,7 +41,9 @@ class OpenAIModel:
         self.action_map = {action.name: action for action in action_space}
         self.chat_history = []
         self.window_size = window_size
-        self.model = model
+        self.model = model if model is not None else (
+            os.getenv("EMOS_LLM_MODEL", "").strip() or "gpt-5.5"
+        )
         self.client = openai.OpenAI()
         self.planning_stage = discussion_stage
         self.code_execution = code_execution

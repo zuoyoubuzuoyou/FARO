@@ -93,8 +93,10 @@ def _termination(value):
     return {k: v for k, v in value.items() if k in _TERM_FIELDS} if isinstance(value, dict) else None
 
 
-class _FrameStream:
-    def __init__(self, task, goal_positions):
+class FrameStream:
+    """Incrementally normalize recorder events without reading future records."""
+
+    def __init__(self, task, goal_positions=None):
         self.task = task
         self.initial_goals = deepcopy(goal_positions or {})
         self.reset()
@@ -105,6 +107,7 @@ class _FrameStream:
                         "goal_positions": deepcopy(self.initial_goals)}
         self.action_scopes = {}
         self.active_actions = {}
+        self.pending_handoffs = set()
         self.histories = {}
         self.sent_counts = Counter()
         self.terminations = {}
@@ -266,14 +269,35 @@ class _FrameStream:
                 self.context["assignments"][agent] = record["subtask_description"]
         elif kind == "action_start" and agent is not None:
             self.active_actions[agent] = record
+            self.pending_handoffs.discard(agent)
             self.terminations.pop(agent, None)
         elif kind == "action_end" and agent is not None:
             active = self.active_actions.get(agent)
-            if active is None or active.get("action_id") == record.get("action_id"):
+            if active is not None and active.get("action_id") != record.get("action_id"):
+                return None
+            termination = _termination({**record, **_mapping(record.get("result"))})
+            if (active is not None and record.get("status") == "timeout"
+                    and termination.get("call_high_level") is False):
+                # Keep the last scope as failed-handoff evidence, not proof of
+                # physical execution. Its termination remains explicitly timeout.
+                self.pending_handoffs.add(agent)
+            else:
                 self.active_actions.pop(agent, None)
-            self.terminations[agent] = _termination({**record, **_mapping(record.get("result"))})
+                self.pending_handoffs.discard(agent)
+            self.terminations[agent] = termination
         elif kind == "skill_termination_signal" and agent is not None:
-            self.terminations[agent] = _termination(record)
+            active = self.active_actions.get(agent)
+            if (active is not None and record.get("action_id") is not None
+                    and active.get("action_id") != record["action_id"]):
+                return None
+            termination = _termination(record)
+            if agent in self.pending_handoffs:
+                if record.get("call_high_level") is True:
+                    self.active_actions.pop(agent, None)
+                    self.pending_handoffs.discard(agent)
+                else:
+                    termination = {**self.terminations.get(agent, {}), **termination}
+            self.terminations[agent] = termination
         elif kind in ("agent_tool_decision", "tool_selection") and record.get("phase", "execution") == "execution":
             self.pending_decision(agent, record.get("action_name"), record.get("parameters"),
                                   2 if kind == "agent_tool_decision" else 1)
@@ -299,7 +323,7 @@ def frames_from_records(records: Iterable[dict], task: str,
     A frame is a mutable JSON dictionary detached from every other frame and
     caller input. An episode_start clears all state, including previous roles.
     """
-    stream = _FrameStream(task, goal_positions)
+    stream = FrameStream(task, goal_positions)
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("Trajectory record must be a JSON object")

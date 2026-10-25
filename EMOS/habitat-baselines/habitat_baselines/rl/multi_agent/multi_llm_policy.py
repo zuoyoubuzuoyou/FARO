@@ -4,6 +4,7 @@ import datetime
 import json
 import re
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from hydra.core.hydra_config import HydraConfig
@@ -445,6 +446,17 @@ ABLATION_MODE = {
     (True, True, True, False) : "NUMERICAL",
 }
 
+def _recovery_json(value):
+    """Detach model history for recovery prompts and JSON artifacts."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {key: _recovery_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_recovery_json(item) for item in value]
+    return deepcopy(value)
+
+
 class MultiLLMPolicy(MultiPolicy):
     """
     Wraps a set of LLM policies. Add group discussion stage before individual policy actions.
@@ -475,6 +487,169 @@ class MultiLLMPolicy(MultiPolicy):
 
     def set_active(self, active_policies):
         self._active_policies = active_policies
+
+    def _recovery_agents(self):
+        return {
+            policy._high_level_policy.llm_agent.name:
+                (policy, policy._high_level_policy.llm_agent)
+            for policy in self._active_policies
+        }
+
+    @staticmethod
+    def _recovery_tools(policy, agent):
+        # Tool schemas can include discussion actions that have no configured
+        # execution controller. Those cannot be forced into the live policy.
+        configured = policy._high_level_policy._skill_name_to_idx
+        return {action.name: action for action in agent.actions
+                if action.name in configured}
+
+    @staticmethod
+    def _recovery_skill(policy, name):
+        skill_id = policy._high_level_policy._skill_name_to_idx[name]
+        skill_id = getattr(policy, "_skill_redirects", {}).get(skill_id, skill_id)
+        return getattr(policy, "_skills", {}).get(skill_id)
+
+    def _recovery_known_entities(self, policy, agent):
+        domains = [getattr(policy, "_pddl", None)]
+        entities = []
+        for name in self._recovery_tools(policy, agent):
+            skill = self._recovery_skill(policy, name)
+            domains.append(getattr(skill, "_pddl_problem", None))
+            entities.extend(getattr(skill, "_all_entities", None) or [])
+        for domain in domains:
+            if domain is not None:
+                entities.extend(domain.get_ordered_entities_list())
+        return sorted({entity.name for entity in entities})
+
+    def _validate_recovery_entities(self, policy, name, arguments):
+        target_fields = [field for field in ("target_obj", "target_location")
+                         if field in arguments]
+        if not target_fields:
+            return
+        skill = self._recovery_skill(policy, name)
+        domain = getattr(skill, "_pddl_problem", None)
+        if domain is None:
+            domain = getattr(policy, "_pddl", None)
+        entities = getattr(skill, "_all_entities", None)
+        if domain is None and entities is None:
+            raise ValueError("Recovery target validation requires a live PDDL entity domain")
+        for field in target_fields:
+            target_name = arguments[field]
+            if domain is not None:
+                try:
+                    target = domain.get_entity(target_name)
+                except KeyError as error:
+                    raise ValueError("Unknown recovery target entity: " + target_name) from error
+            else:
+                target = next((entity for entity in entities
+                               if entity.name == target_name), None)
+            if target is None or (entities is not None and target not in entities):
+                raise ValueError("Recovery target entity is unavailable to skill "
+                                 + name + ": " + target_name)
+
+    def get_recovery_context(self, history_turns=10):
+        """Export live task/planner context without changing agent state."""
+        if isinstance(history_turns, bool) or not isinstance(history_turns, int) or history_turns < 0:
+            raise ValueError("history_turns must be a nonnegative integer")
+        agents = {}
+        for agent_id, (policy, agent) in self._recovery_agents().items():
+            history = getattr(agent.llm_model, "chat_history", [])
+            current = int(policy._cur_skills[0])
+            agents[agent_id] = {
+                "task_description": getattr(agent, "task_description", ""),
+                "subtask_description": getattr(agent, "subtask_description", ""),
+                "planner_plan": getattr(agent, "planner_plan", None),
+                "recent_history": _recovery_json(history[-history_turns:] if history_turns else []),
+                "available_tools": [action.to_openai_json_schema() for action in
+                                    self._recovery_tools(policy, agent).values()],
+                "known_entities": self._recovery_known_entities(policy, agent),
+                "current_skill": policy._idx_to_name.get(current),
+            }
+        return {"agents": agents}
+
+    def _validated_recovery_commands(self, commands):
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("Recovery commands must be a nonempty list")
+        agents = self._recovery_agents()
+        prepared = []
+        fields = {
+            "resume": {"type", "agent", "reason", "instruction"},
+            "replan": {"type", "agent", "instruction"},
+            "action": {"type", "agent", "name", "arguments"},
+        }
+        for command in commands:
+            if not isinstance(command, dict):
+                raise ValueError("Each recovery command must be an object")
+            kind = command.get("type")
+            if not isinstance(kind, str) or kind not in fields:
+                raise ValueError("Unknown recovery command type")
+            if set(command) - fields[kind]:
+                raise ValueError("Unexpected fields in recovery command")
+            agent_id = command.get("agent")
+            if not isinstance(agent_id, str) or agent_id not in agents:
+                raise ValueError("Unknown recovery agent")
+            policy, agent = agents[agent_id]
+            if not agent.initialized or agent.llm_model is None:
+                raise ValueError("Recovery requires an initialized live agent")
+            if len(policy._cur_call_high_level) != 1:
+                raise ValueError("Live recovery requires a single environment")
+            if kind == "resume":
+                for field in ("reason", "instruction"):
+                    if field in command and not isinstance(command[field], str):
+                        raise ValueError(field + " must be a string")
+            elif kind == "replan":
+                instruction = command.get("instruction")
+                if not isinstance(instruction, str) or not instruction.strip():
+                    raise ValueError("Replan requires a nonempty instruction")
+            else:
+                name = command.get("name")
+                actions = self._recovery_tools(policy, agent)
+                if not isinstance(name, str) or name not in actions:
+                    raise ValueError("Unknown or unconfigured recovery action")
+                arguments = command.get("arguments")
+                if not isinstance(arguments, dict):
+                    raise ValueError("Recovery action arguments must be an object")
+                parameters = actions[name].parameters
+                if set(arguments) - set(parameters.model_fields):
+                    raise ValueError("Unexpected recovery action arguments")
+                # Pydantic otherwise ignores extra fields and may coerce values.
+                # Forced actions must obey the actual public action signature.
+                parameters.model_validate(arguments, strict=True)
+                self._validate_recovery_entities(policy, name, arguments)
+            prepared.append((policy, agent, command))
+        return prepared
+
+    def validate_recovery_commands(self, commands):
+        """Validate the entire batch without consuming or changing anything."""
+        self._validated_recovery_commands(commands)
+
+    def apply_recovery_commands(self, commands):
+        """Route a validated batch into the existing controllers without reset."""
+        commands = deepcopy(commands)
+        prepared = self._validated_recovery_commands(commands)
+        staged = {}
+        for policy, agent, command in prepared:
+            # A later recovery round supersedes any unconsumed recovery actions.
+            state = staged.setdefault(agent.name, {
+                "policy": policy, "agent": agent, "actions": [], "feedback": [],
+            })
+            if command["type"] == "action":
+                state["actions"].append(command)
+            else:
+                instruction = command.get("instruction", "")
+                reason = command.get("reason", "")
+                state["feedback"].append(
+                    "Live recovery interrupted the previous controller action; "
+                    "do not assume it succeeded. "
+                    + ("Replan the remaining task" if command["type"] == "replan" else "Resume the task")
+                    + " from the current simulator state. " + reason + " " + instruction
+                )
+        for state in staged.values():
+            agent = state["agent"]
+            agent._recovery_actions = state["actions"]
+            agent._recovery_feedback = state["feedback"]
+            state["policy"]._cur_call_high_level[0] = True
+        return {"applied": deepcopy(commands), "simulator_reset": False}
 
     def on_envs_pause(self, envs_to_pause):
         for policy in self._active_policies:
@@ -523,15 +698,17 @@ class MultiLLMPolicy(MultiPolicy):
         text_goal = observations["pddl_text_goal"][0].tolist()
         text_goal = "".join([chr(code) for code in text_goal]).strip()
         # text_goal = "Fill in a tank with water. The tank is 80cm high, 50cm wide, and 50cm deep. The tank is empty. agent_0 has a 1L backet and agent_1 has a 2L bucket. Use function call to compute how many time agent_1 and agent_2 needs to fill the tank to full."
-        # Stage 1: If all prev_actions are zero, which means it is the first step of the episode, then we need to do group discussion
+        # Stage 1: Reset masks or uninitialized agents mark an episode start.
+        # Valid wait/control actions can be all zero during a live episode.
         # Given: Robot resume + Scene description + task instruction
         # Output: (Subtask decomposition) + task assignment
         envs_agent_arguments = []
         for i in range(n_envs):
-            env_prev_actions = prev_actions[i]
             env_text_context = envs_text_context[i]
-            # if no previous actions, then it is the first step of the episode
-            if not env_prev_actions.any():
+            if not bool(masks[i].all()) or any(
+                not policy._high_level_policy.llm_agent.initialized
+                for policy in self._active_policies
+            ):
                 if "robot_resume" in env_text_context:
                     robot_resume = env_text_context["robot_resume"]
                 if "scene_description" in env_text_context:

@@ -349,6 +349,45 @@ class RLTaskEnv(habitat.RLEnv):
         )
         return self._env.task.get_task_text_context()
 
+    def apply_runtime_source_patch(self, manifest: dict) -> dict:
+        """Install methods on existing worker objects without recreating the env.
+
+        The VectorEnv RPC dispatcher propagates uncaught exceptions out of its
+        worker loop, so patch failures must cross this boundary as data.
+        """
+        try:
+            if not hasattr(self, "_runtime_source_patcher"):
+                from habitat_mas.recovery.source_patch import RuntimeSourcePatcher
+                from habitat_mas.recovery.source_runtime import REPOSITORY_ROOT
+                self._runtime_source_patcher = RuntimeSourcePatcher(REPOSITORY_ROOT)
+            return self._runtime_source_patcher.install(manifest)
+        except Exception as error:
+            from habitat_mas.utils.trajectory import redact
+            return {"status": "error", "error": redact(str(error)),
+                    "error_type": type(error).__name__}
+
+    def check_runtime_source_rollback(self, transaction_id: str) -> dict:
+        """Validate worker rollback before the parent changes any component."""
+        try:
+            if not hasattr(self, "_runtime_source_patcher"):
+                raise ValueError("No runtime source patch has been installed")
+            return self._runtime_source_patcher.check_rollback(transaction_id)
+        except Exception as error:
+            from habitat_mas.utils.trajectory import redact
+            return {"status": "error", "error": redact(str(error)),
+                    "error_type": type(error).__name__}
+
+    def rollback_runtime_source_patch(self, transaction_id: str) -> dict:
+        """Revert a worker revision through the existing public RPC path."""
+        try:
+            if not hasattr(self, "_runtime_source_patcher"):
+                raise ValueError("No runtime source patch has been installed")
+            return self._runtime_source_patcher.rollback(transaction_id)
+        except Exception as error:
+            from habitat_mas.utils.trajectory import redact
+            return {"status": "error", "error": redact(str(error)),
+                    "error_type": type(error).__name__}
+
 
 @habitat.registry.register_env(name="GymRegistryEnv")
 class GymRegistryEnv(gym.Wrapper):

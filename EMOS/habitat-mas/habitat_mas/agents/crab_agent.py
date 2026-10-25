@@ -1,4 +1,6 @@
 from typing import List, Optional
+from copy import deepcopy
+import json
 
 from .crab_core import Action
 from ..utils.models import OpenAIModel
@@ -39,6 +41,9 @@ class CrabAgent:
         self.llm_model:OpenAIModel = None
         self.initialized = False
         self.start_act = False
+        self.planner_plan = None
+        self._recovery_actions = []
+        self._recovery_feedback = []
 
         self.action_prompt = _generate_action_prompt(self.actions, include_arguments=True)
 
@@ -85,6 +90,8 @@ class CrabAgent:
 
         self.initialized = True
         self.start_act = False
+        self._recovery_actions = []
+        self._recovery_feedback = []
 
         # Guide agent to decouple subtasks into actions
         if len(subtask_description) > 0:
@@ -104,6 +111,7 @@ class CrabAgent:
         print("===============CrabAgent Prompt==============")
         print(subtask_to_actions_prompt)
         response = self.llm_model.chat(subtask_to_actions_prompt, crab_planning=True)
+        self.planner_plan = response
         print("===============CrabAgent Subtasks==============")
         print(response)
 
@@ -136,7 +144,30 @@ class CrabAgent:
                 )
             CrabAgent.message_pipe[self.name] = []
 
-        action_name, parameters = self.llm_model.chat(str(observation))
+        if self._recovery_feedback:
+            observation = str(observation) + "\n\n" + "\n".join(self._recovery_feedback)
+            self._recovery_feedback = []
+
+        if self._recovery_actions:
+            command = self._recovery_actions.pop(0)
+            action_name = command["name"]
+            parameters = deepcopy(command["arguments"])
+            # Keep the forced decision in the same conversation the next model
+            # request will see, without inventing a successful tool result.
+            self.llm_model.chat_history.append([
+                {"role": "user", "content": str(observation)},
+                {"role": "assistant", "content": (
+                    "Live recovery selected the following tool; its outcome is "
+                    "not yet known: " + json.dumps(command, ensure_ascii=False)
+                )},
+            ])
+            record_event(
+                "recovery_action", agent_name=self.name, phase="execution",
+                action_name=action_name, parameters=parameters,
+                source="validated_recovery_command", simulator_reset=False,
+            )
+        else:
+            action_name, parameters = self.llm_model.chat(str(observation))
         record_event(
             "agent_tool_decision", agent_name=self.name, phase="execution",
             action_name=action_name, parameters=parameters,

@@ -11,6 +11,7 @@ from hydra.core.config_store import ConfigStore
 from omegaconf import MISSING
 
 from habitat.config.default_structured_configs import SimulatorSensorConfig
+from habitat_mas.recovery.config import RecoveryConfig
 
 cs = ConfigStore.instance()
 
@@ -48,6 +49,7 @@ class EvalConfig(HabitatBaselinesBaseConfig):
     # Structured MAS evaluation traces, one JSONL stream per episode attempt.
     save_trajectories: bool = True
     trajectory_dir: str = "runs"
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     video_option: List[str] = field(
         # available options are "disk" and "tensorboard"
         default_factory=list

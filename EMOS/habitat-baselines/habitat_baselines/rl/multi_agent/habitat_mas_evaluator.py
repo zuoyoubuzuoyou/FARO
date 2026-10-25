@@ -1,4 +1,5 @@
 import os
+import sys
 from copy import deepcopy
 from collections import defaultdict
 from contextlib import nullcontext
@@ -53,7 +54,11 @@ class HabitatMASEvaluator(Evaluator):
             obs_transforms, env_spec, rank0_keys,
         )
         eval_config = config.habitat_baselines.eval
-        if not eval_config.save_trajectories:
+        recovery_config = getattr(eval_config, "recovery", None)
+        recovery_enabled = bool(getattr(recovery_config, "enabled", False))
+        if recovery_enabled and envs.num_envs != 1:
+            raise ValueError("Online recovery currently requires a single environment")
+        if not eval_config.save_trajectories and not recovery_enabled:
             return self._evaluate_agent(*args)
 
         try:
@@ -64,9 +69,23 @@ class HabitatMASEvaluator(Evaluator):
         try:
             trajectory = EvaluationTrace(eval_config.trajectory_dir, metadata)
         except Exception as error:
+            if recovery_enabled:
+                raise RuntimeError("Online recovery requires trajectory recording") from error
             logger.warning("Could not initialize trajectory recording: %s", redact(str(error)))
             return self._evaluate_agent(*args)
         with trajectory:
+            recovery = None
+            if recovery_enabled:
+                from habitat_mas.recovery.online import OnlineRecovery
+
+                task_hint = getattr(recovery_config, "task", "auto")
+                if task_hint == "auto":
+                    task_hint = getattr(config.habitat.task, "task_spec", "auto") or "auto"
+                recovery = OnlineRecovery(
+                    recovery_config, trajectory.run_dir / "recovery", task=task_hint,
+                    envs=envs,
+                )
+                trajectory.event_callback = recovery.on_event
             logger.info("Saving structured trajectories to %s", trajectory.run_dir)
             try:
                 try:
@@ -75,10 +94,20 @@ class HabitatMASEvaluator(Evaluator):
                         [{"enabled": True} for _ in range(envs.num_envs)],
                     )
                 except Exception as error:
+                    if recovery_enabled:
+                        raise RuntimeError("Online recovery requires state capture setup") from error
                     logger.warning("Could not enable trajectory state capture: %s", redact(str(error)))
-                return self._evaluate_agent(*args, trajectory=trajectory)
+                return self._evaluate_agent(*args, trajectory=trajectory, recovery=recovery)
             finally:
                 # Cleanup must not replace an exception from the evaluated task.
+                had_error = sys.exc_info()[0] is not None
+                cleanup_error = None
+                try:
+                    if recovery is not None:
+                        recovery.close()
+                except Exception as error:
+                    cleanup_error = error
+                    logger.error("Could not restore recovery source revisions: %s", redact(str(error)))
                 try:
                     if envs.num_envs:
                         envs.call(
@@ -87,6 +116,8 @@ class HabitatMASEvaluator(Evaluator):
                         )
                 except Exception as error:
                     logger.warning("Could not disable trajectory recording: %s", redact(str(error)))
+                if cleanup_error is not None and not had_error:
+                    raise RuntimeError("Could not restore recovery source revisions") from cleanup_error
 
     def _evaluate_agent(
         self,
@@ -101,6 +132,7 @@ class HabitatMASEvaluator(Evaluator):
         env_spec,
         rank0_keys,
         trajectory=None,
+        recovery=None,
     ):
         observations = envs.reset()
         observations = envs.post_step(observations)
@@ -243,10 +275,16 @@ class HabitatMASEvaluator(Evaluator):
                     try:
                         state = envs.call_at(i, "get_trajectory_state")
                     except Exception as error:
+                        if recovery is not None:
+                            raise RuntimeError("Online recovery requires initial simulator state") from error
                         logger.warning("Could not capture initial trajectory state: %s", error)
+                    if recovery is not None and not isinstance(state, dict):
+                        raise RuntimeError("Online recovery requires initial simulator state")
                     try:
                         trajectory.start_episode(i, episode, context=context, state=state)
                     except Exception as error:
+                        if recovery is not None:
+                            raise RuntimeError("Online recovery could not start episode recording") from error
                         logger.warning("Could not start trajectory episode: %s", error)
 
             space_lengths = {}
@@ -260,14 +298,21 @@ class HabitatMASEvaluator(Evaluator):
                 trajectory.policy_step(observations=batch)
                 if trajectory is not None else nullcontext()
             ):
-                action_data = agent.actor_critic.act(
-                    batch,
-                    test_recurrent_hidden_states,
-                    prev_actions,
-                    not_done_masks,
-                    deterministic=False,
-                    envs_text_context=envs_text_context,
-                    **space_lengths,
+                def policy_attempt():
+                    return agent.actor_critic.act(
+                        batch,
+                        test_recurrent_hidden_states,
+                        prev_actions,
+                        not_done_masks,
+                        deterministic=False,
+                        envs_text_context=envs_text_context,
+                        **space_lengths,
+                    )
+
+                action_data = (
+                    recovery.run_policy(policy_attempt, agent.actor_critic,
+                        tensors=(test_recurrent_hidden_states, prev_actions, not_done_masks))
+                    if recovery is not None else policy_attempt()
                 )
                 if action_data.should_inserts is None:
                     test_recurrent_hidden_states = (
@@ -316,6 +361,11 @@ class HabitatMASEvaluator(Evaluator):
             state_errors = [
                 info.pop("__trajectory_state_error", None) for info in infos
             ]
+            if recovery is not None and (
+                any(error is not None for error in state_errors)
+                or any(not isinstance(state, dict) for state in trajectory_states)
+            ):
+                raise RuntimeError("Online recovery requires returned simulator state for every step")
             if trajectory is not None:
                 for i, error in enumerate(state_errors):
                     if error is not None:
@@ -353,6 +403,10 @@ class HabitatMASEvaluator(Evaluator):
                         success=original_successes[i],
                         termination_reason=(trajectory_states[i] or {}).get("termination_reason"),
                     )
+            if recovery is not None:
+                # The simulator remains live while diagnosis/generation runs.
+                # Terminal frames are audited; VectorEnv has already reset them.
+                recovery.advance(agent.actor_critic, dones)
 
             observations = envs.post_step(observations)
             batch = batch_obs(  # type: ignore
@@ -499,6 +553,9 @@ class HabitatMASEvaluator(Evaluator):
 
             if trajectory is not None:
                 trajectory.pause_envs(envs_to_pause)
+            if recovery is not None and envs_to_pause:
+                # Source rollback needs the worker's active RPC connection.
+                recovery.close()
             not_done_masks = not_done_masks.to(device=device)
             (
                 envs,
