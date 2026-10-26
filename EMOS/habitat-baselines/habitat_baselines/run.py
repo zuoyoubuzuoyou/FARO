@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 )
 def main(cfg: "DictConfig"):
     cfg = patch_config(cfg)
+    model = cfg.habitat_baselines.llm_model
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("habitat_baselines.llm_model must be a nonempty model name")
     execute_exp(cfg, "eval" if cfg.habitat_baselines.evaluate else "train")
 
 

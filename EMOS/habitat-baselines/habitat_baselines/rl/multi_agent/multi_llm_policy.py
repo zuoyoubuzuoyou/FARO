@@ -255,6 +255,9 @@ def group_discussion(
     should_robot_resume: bool = True, 
     should_numerical: bool = True,
     max_discussion_rounds = 3,
+    model=None,
+    temperature=None,
+    seed=None,
 ) -> dict[str, AgentArguments]:
 
     ### 0. whether save chat history or not
@@ -308,6 +311,9 @@ def group_discussion(
     leader = OpenAIModel(
         leader_prompt,
         DISCUSSION_TOOLS,
+        model=model,
+        temperature=temperature,
+        seed=seed,
         discussion_stage=True,
         code_execution=False,
         enable_logging=save_chat_history,
@@ -330,6 +336,9 @@ def group_discussion(
         agents[robot_key] = OpenAIModel(
             robot_prompt,
             DISCUSSION_TOOLS,
+            model=model,
+            temperature=temperature,
+            seed=seed,
             discussion_stage=True,
             code_execution=execute_code,
             enable_logging=save_chat_history,
@@ -464,6 +473,11 @@ class MultiLLMPolicy(MultiPolicy):
 
     def __init__(self, update_obs_with_agent_prefix_fn, **kwargs):
         self._active_policies = []
+        self._llm_model_name = kwargs.get("llm_model", "gpt-5.6-sol").strip()
+        if not self._llm_model_name:
+            raise ValueError("habitat_baselines.llm_model must be a nonempty model name")
+        self._llm_temperature = kwargs.get("llm_temperature")
+        self._llm_seed = kwargs.get("llm_seed")
         if update_obs_with_agent_prefix_fn is None:
             update_obs_with_agent_prefix_fn = update_dict_with_agent_prefix
         self._update_obs_with_agent_prefix_fn = update_obs_with_agent_prefix_fn
@@ -734,6 +748,9 @@ class MultiLLMPolicy(MultiPolicy):
                     save_chat_history=save_chat_history,
                     save_chat_history_dir=save_chat_history_dir,
                     episode_id=episode_id,
+                    model=self._llm_model_name,
+                    temperature=self._llm_temperature,
+                    seed=self._llm_seed,
                 )
                 for robot_id, assignment in agent_arguments.items():
                     record_event(
@@ -781,6 +798,9 @@ class MultiLLMPolicy(MultiPolicy):
                     chat_history=args.chat_history,
                     enable_logging=save_chat_history,
                     logging_file=logging_path,
+                    model=self._llm_model_name,
+                    temperature=self._llm_temperature,
+                    seed=self._llm_seed,
                 )
 
             # Run the policy
@@ -996,6 +1016,9 @@ class MultiLLMPolicy(MultiPolicy):
         update_obs_with_agent_prefix_fn: Optional[Callable] = None,
         **kwargs,
     ):
+        kwargs["llm_model"] = config.habitat_baselines.llm_model
+        kwargs["llm_temperature"] = config.habitat_baselines.llm_temperature
+        kwargs["llm_seed"] = config.habitat_baselines.llm_seed
         kwargs["should_terminate_on_wait"] = config.habitat.dataset.should_terminate_on_wait
         kwargs["should_group_discussion"] = config.habitat.dataset.should_group_discussion
         kwargs["should_agent_reflection"] = config.habitat.dataset.should_agent_reflection

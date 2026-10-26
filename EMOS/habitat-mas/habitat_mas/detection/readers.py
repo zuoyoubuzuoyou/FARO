@@ -1,4 +1,4 @@
-"""Streaming, causal adapters for historical frames and recorder-v2 events.
+"""Streaming, causal adapters for historical frames and V2/V3 recordings.
 
 Only an environment frame yields an observation. Episode summaries, injected
 fault state, detector outputs, rewards and historical/latched stage metrics
@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import re
 from typing import Iterable, Iterator, Optional
+
+from habitat_mas.utils.trajectory_storage import iter_trace_events
 
 
 _NAV_FIELDS = frozenset(("available", "timing", "active", "target", "reason",
@@ -340,16 +342,5 @@ def frames_from_records(records: Iterable[dict], task: str,
 
 
 def iter_frames(path, task: str, goal_positions: Optional[dict] = None) -> Iterator[dict]:
-    """Read JSONL lazily; malformed input includes the file and line number."""
-    path = Path(path)
-    def records():
-        with path.open(encoding="utf-8-sig") as source:
-            for line_number, line in enumerate(source, 1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError as error:
-                    raise ValueError(f"{path}: line {line_number}: {error}") from error
-                yield record
-    yield from frames_from_records(records(), task, goal_positions)
+    """Read historical event files or expand checked environment-step storage."""
+    yield from frames_from_records(iter_trace_events(path), task, goal_positions)

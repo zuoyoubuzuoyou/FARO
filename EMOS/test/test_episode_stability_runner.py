@@ -17,6 +17,26 @@ SETTINGS = {"model": "gpt-6-sol", "temperature": 0.0, "model_seed": 100}
 
 
 class StabilityRunnerTests(unittest.TestCase):
+    def test_worker_passes_model_as_hydra_override_without_using_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("data", "res", "configs", "habitat-lab", "habitat-baselines", "habitat-mas"):
+                (root / name).mkdir()
+            trial = {"trial_dir": str(root / "trial"), "dataset_file": "episode.json.gz",
+                     "trajectory_dir": str(root / "trajectories")}
+            settings = {**runner.DEFAULT_SETTINGS, "model": "selected-model", "robot_config": "robots.json"}
+            spec = root / "worker.json"
+            spec.write_text(json.dumps({"settings": settings, "trial": trial}))
+            with patch.dict(os.environ, {"EMOS_LLM_MODEL": "ignored-model"}), patch.object(
+                    sys, "path", list(sys.path)), patch.object(sys, "argv", []), patch.object(
+                    runner, "ROOT", root), patch.object(runner.os, "chdir"), patch.object(
+                    runner, "install_decoding_controls"), patch.object(runner.runpy, "run_module"):
+                runner.worker(spec, config_only=True)
+                self.assertIn("habitat_baselines.llm_model=selected-model", sys.argv)
+                self.assertIn("habitat_baselines.llm_temperature=0.0", sys.argv)
+                self.assertIn("habitat_baselines.llm_seed=100", sys.argv)
+                self.assertEqual(os.environ["EMOS_LLM_MODEL"], "ignored-model")
+
     def test_sampling_does_not_depend_on_input_order_or_old_outcomes(self):
         episodes = [{"scene_id": "scene", "episode_id": str(i), "success": i % 2}
                     for i in range(4)]

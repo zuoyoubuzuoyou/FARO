@@ -458,6 +458,11 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # If habitat_baselines.evaluate is true, the run will be in evaluation mode
     # replaces --run-type eval when true
     evaluate: bool = False
+    # EMOS task model for group discussion, planning and execution.
+    llm_model: str = "gpt-5.6-sol"
+    # None leaves the corresponding parameter out of task-model API requests.
+    llm_temperature: Optional[float] = None
+    llm_seed: Optional[int] = None
     trainer_name: str = "ppo"
     updater_name: str = "PPO"
     distrib_updater_name: str = "DDPPO"

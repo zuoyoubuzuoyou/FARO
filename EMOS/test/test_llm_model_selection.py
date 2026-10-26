@@ -44,8 +44,8 @@ class LLMModelSelectionTests(unittest.TestCase):
                 )
         return transport.requests[0]["model"]
 
-    def test_environment_selects_request_model_when_argument_is_omitted(self):
-        self.assertEqual(self.requested_model("gpt-6-sol"), "gpt-6-sol")
+    def test_environment_is_ignored_when_argument_is_omitted(self):
+        self.assertEqual(self.requested_model("gpt-6-sol"), "gpt-5.6-sol")
 
     def test_explicit_argument_takes_precedence_over_environment(self):
         self.assertEqual(
@@ -53,19 +53,19 @@ class LLMModelSelectionTests(unittest.TestCase):
             "explicit-model",
         )
 
-    def test_none_argument_uses_environment_model(self):
+    def test_none_argument_uses_default_despite_environment(self):
         self.assertEqual(
-            self.requested_model("gpt-6-sol", model=None), "gpt-6-sol",
+            self.requested_model("gpt-6-sol", model=None), "gpt-5.6-sol",
         )
 
-    def test_unconfigured_model_preserves_legacy_default(self):
-        self.assertEqual(self.requested_model(), "gpt-5.5")
+    def test_unconfigured_model_uses_gpt_5_6_sol_default(self):
+        self.assertEqual(self.requested_model(), "gpt-5.6-sol")
 
-    def test_whitespace_environment_uses_legacy_default(self):
-        self.assertEqual(self.requested_model(" \t "), "gpt-5.5")
+    def test_whitespace_environment_uses_gpt_5_6_sol_default(self):
+        self.assertEqual(self.requested_model(" \t "), "gpt-5.6-sol")
 
-    def test_environment_model_is_trimmed_before_request(self):
-        self.assertEqual(self.requested_model(" gpt-6-sol \n"), "gpt-6-sol")
+    def test_nonblank_environment_with_whitespace_is_ignored(self):
+        self.assertEqual(self.requested_model(" gpt-6-sol \n"), "gpt-5.6-sol")
 
 
 if __name__ == "__main__":

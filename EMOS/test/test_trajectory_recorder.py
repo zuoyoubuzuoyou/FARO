@@ -1,5 +1,7 @@
 """Dependency-free tests for evaluation trajectory recording."""
 
+from trajectory_test_utils import read_episode_events
+
 import dataclasses
 import importlib.util
 import json
@@ -29,10 +31,7 @@ def load_recorder():
 
 
 def read_events(directory):
-    return [
-        [json.loads(line) for line in path.read_text().splitlines()]
-        for path in sorted(directory.rglob("*.jsonl"))
-    ]
+    return read_episode_events(directory)
 
 
 def episode(scene="scene.glb", identifier="episode-1"):
@@ -50,9 +49,9 @@ class TrajectoryRecorderTest(unittest.TestCase):
         with recorder.EvaluationTrace(
             self.output_dir, metadata={"experiment": "餐具", "seed": 7}
         ) as trace:
-            metadata = json.loads((trace.run_dir / "run.json").read_text())
+            metadata = json.loads((trace.run_dir / "config.json").read_text())
             self.assertEqual(metadata["metadata"]["experiment"], "餐具")
-            self.assertEqual(metadata["schema_version"], 2)
+            self.assertEqual(metadata["schema_version"], 3)
             trace.start_episode(
                 0, episode(), context={"instruction": "move"},
                 state={"position": [0, 1, 2]},
@@ -100,7 +99,7 @@ class TrajectoryRecorderTest(unittest.TestCase):
                 self.assertEqual(item["scene_id"], "scene.glb")
                 self.assertEqual(item["episode_id"], "episode-1")
                 self.assertEqual(item["env_index"], 0)
-                self.assertEqual(item["schema_version"], 2)
+                self.assertEqual(item["schema_version"], 3)
                 self.assertTrue(item["timestamp"].endswith("+00:00"))
             elapsed = [item["elapsed_seconds"] for item in events]
             self.assertEqual(elapsed, sorted(elapsed))
@@ -150,7 +149,7 @@ class TrajectoryRecorderTest(unittest.TestCase):
             self.assertEqual(event["scalar"], 2.5)
             self.assertEqual(event["collection"]["tuple"], [1, 2])
             self.assertEqual(set(event["collection"]["set"]), {3, 4})
-            raw = next(trace.run_dir.rglob("*.jsonl")).read_text()
+            raw = json.dumps(read_events(trace.run_dir), ensure_ascii=False)
             self.assertNotIn("NaN", raw)
             self.assertNotIn("Infinity", raw)
 

@@ -98,6 +98,7 @@ data
 *.mp4
 /chat_history_output/
 /trajectory_output/
+/trajectory/
 /runs/
 
 # outputs from other libraries

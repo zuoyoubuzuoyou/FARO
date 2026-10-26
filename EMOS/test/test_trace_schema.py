@@ -12,9 +12,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "habitat-mas"))
 from habitat_mas.utils import trajectory as trace_module
+from trajectory_test_utils import iter_trace_events, read_trace_summary
 
 
 def read(path):
+    if Path(path).name == "summary.json":
+        return read_trace_summary(path)
     return json.loads(Path(path).read_text())
 
 
@@ -34,8 +37,7 @@ class ResearchTraceTests(unittest.TestCase):
         return next((self.trace.run_dir / "episodes").iterdir())
 
     def events(self):
-        return [json.loads(line) for line in
-                (self.episode_dir() / "events.jsonl").read_text().splitlines()]
+        return list(iter_trace_events(self.episode_dir() / "steps.jsonl"))
 
     def test_action_lifecycle_and_distinct_agent_decision_counts(self):
         with self.trace.policy_step():
@@ -68,7 +70,7 @@ class ResearchTraceTests(unittest.TestCase):
         self.assertEqual(summary["decision_counts"], {"agent_0": 1})
         self.assertEqual(summary["termination_reason"], "success")
         self.assertEqual(summary["last_actions"]["agent_0"]["action_id"], action_id)
-        self.assertTrue((self.episode_dir() / summary["files"]["events"]).is_file())
+        self.assertTrue((self.episode_dir() / summary["files"]["steps"]).is_file())
 
     def test_pending_submission_survives_exception_with_same_action_id(self):
         with self.trace.policy_step():

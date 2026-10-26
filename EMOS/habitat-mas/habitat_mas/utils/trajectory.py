@@ -25,8 +25,20 @@ import time
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
-SCHEMA_VERSION = 2
+# Also support dependency-free loading via importlib.spec_from_file_location.
+if __package__:
+    from .trajectory_storage import StepTraceStore
+else:
+    import importlib.util
+    _storage_spec = importlib.util.spec_from_file_location(
+        "_standalone_trajectory_storage", Path(__file__).with_name("trajectory_storage.py"))
+    _storage_module = importlib.util.module_from_spec(_storage_spec)
+    _storage_spec.loader.exec_module(_storage_module)
+    StepTraceStore = _storage_module.StepTraceStore
+
+SCHEMA_VERSION = 3
 _ACTIVE_WRITER = ContextVar("evaluation_trace_writer", default=None)
 _DECISION = ContextVar("evaluation_trace_decision", default=None)
 _OBSERVATIONS = ContextVar("evaluation_trace_observations", default=None)
@@ -130,6 +142,19 @@ def _timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _allocate_directory(parent, name, suffix="_"):
+    """Reserve a readable directory atomically, including colliding attempts."""
+    attempt = 1
+    while True:
+        candidate = parent / (name if attempt == 1 else f"{name}{suffix}{attempt:02d}")
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            attempt += 1
+        else:
+            return candidate
+
+
 def _write_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(_encode(value) + "\n", encoding="utf-8")
@@ -221,8 +246,11 @@ class _EpisodeWriter:
             "env_index": env_index, "evaluation_id": str(uuid4()),
         }
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(episode.episode_id))[:80].strip(".") or "episode"
-        self.directory = owner.run_dir / "episodes" / f"{safe_id}--{self.identity['evaluation_id']}"
-        self.directory.mkdir(parents=True)
+        identifier = str(episode.episode_id)
+        if re.fullmatch(r"[0-9]+", identifier):
+            safe_id = identifier.lstrip("0")[:80].zfill(4)
+        self.directory = _allocate_directory(
+            owner.run_dir / "episodes", f"episode_{safe_id}", suffix="_attempt_")
         (self.directory / "media").mkdir()
         self.num_steps = 0
         self.total_reward = 0.0
@@ -252,12 +280,12 @@ class _EpisodeWriter:
         if state is None:
             self.missing_fields["initial_state"] = "Environment did not supply an initial state"
         self.files = {"config": "../../config.json", "episode": "episode.json",
-                      "events": "events.jsonl", "summary": "summary.json", "media": "media/"}
+                      "steps": "steps.jsonl", "summary": "summary.json", "media": "media/"}
         snapshot = {**self.identity, "timestamp": _timestamp(), "context": context,
                     "initial_state": state, "success_measure": owner.metadata.get("success_measure"),
                     "missing_fields": dict(self.missing_fields), "files": self.files}
         _write_json(self.directory / "episode.json", self.prepare(snapshot))
-        self.stream = (self.directory / "events.jsonl").open("x", encoding="utf-8")
+        self.store = StepTraceStore(self.directory, self.identity)
         self.write("episode_start", 0, context=context, state=state)
 
     def _save_bytes(self, content, suffix, source, seen_by_llm):
@@ -377,8 +405,7 @@ class _EpisodeWriter:
                 absent.setdefault("action_id", "No execution action is associated with this event")
             if decision is None:
                 absent.setdefault("decision_step", "No agent decision is associated with this event")
-        self.stream.write(_encode(payload) + "\n")
-        self.stream.flush()
+        self.store.append(payload)
         self.sequence += 1
         self.last_event_step = step
         has_error = bool(payload.get("error_type") or payload.get("error"))
@@ -405,7 +432,13 @@ class _EpisodeWriter:
         if self.owner.event_callback is not None:
             # Callbacks only enqueue detached events; online work runs after
             # the returned environment transition, outside logging hooks.
-            self.owner.event_callback(deepcopy(payload))
+            try:
+                self.owner.event_callback(deepcopy(payload))
+            except Exception as error:
+                # Observer failures must not interrupt a completed transition
+                # or strand the next step behind an uncommitted packet.
+                self.logging_error_count += 1
+                _LOG.warning("Trajectory observer failed (%s): %s", type(error).__name__, redact(str(error)))
         return payload
 
     def begin_action(self, agent_id, name, parameters, step, **data):
@@ -474,6 +507,8 @@ class _EpisodeWriter:
             self.success = _json_value(success)
             self.termination_reason = termination_reason or (state or {}).get("termination_reason")
             self.finish("completed")
+        else:
+            self.store.commit_step()
 
     def finish(self, status, error=None):
         if self.closed:
@@ -528,13 +563,16 @@ class _EpisodeWriter:
             "media": self.media, "missing_fields": missing,
         })
         try:
-            _write_json(self.directory / "summary.json", summary)
-            # The final event has the same snapshot as the separate summary.
+            # Persist the terminal event before committing its returned step.
             fields = {k: v for k, v in summary.items() if k not in self.identity and k != "elapsed_seconds"}
             self.write("episode_end", max(self.num_steps, self.last_event_step), **fields)
+            if status == "completed":
+                self.store.commit_step()
+            summary["logging_error_count"] = self.logging_error_count
+            self.store.write_summary(summary)
         finally:
             self.closed = True
-            self.stream.close()
+            self.store.close()
 
 
 class EvaluationTrace:
@@ -546,8 +584,8 @@ class EvaluationTrace:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = str(uuid4())
-        self.run_dir = output_dir / self.run_id
-        self.run_dir.mkdir()
+        run_name = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("run_%Y%m%d_%H%M%S")
+        self.run_dir = _allocate_directory(output_dir, run_name)
         (self.run_dir / "episodes").mkdir()
         self._episodes = {}
         self._closed = False
@@ -568,8 +606,6 @@ class EvaluationTrace:
 
     def _save_config(self):
         _write_json(self.run_dir / "config.json", self.config)
-        # Retain the v1 run metadata filename for existing analysis scripts.
-        _write_json(self.run_dir / "run.json", self.config)
 
     def register_model(self, event):
         if event["event_type"] == "llm_response":

@@ -1,5 +1,7 @@
 """Exercise the real skill lifecycle without scene assets or model calls."""
 
+from trajectory_test_utils import read_events as expanded_events
+
 import ast
 from collections import defaultdict
 import json
@@ -143,8 +145,7 @@ class ExecutionTrajectoryTests(unittest.TestCase):
                     results.append(result.take_actions.tolist())
                     trace.record_step(0, result.take_actions, 0.0, False, {},
                                       {"position": [step + 1, 0, 0]})
-            events = [json.loads(line) for path in Path(output).rglob("*.jsonl")
-                      for line in path.read_text().splitlines()]
+            events = expanded_events(output)
         return results, events
 
     def test_one_action_spans_steps_and_timeout_closes_after_final_state(self):
@@ -217,8 +218,7 @@ class ExecutionTrajectoryTests(unittest.TestCase):
                             make_policy(skill).act(Observations(), torch.zeros(1, 1),
                                                    torch.zeros(1, 3), torch.ones(1, 1, dtype=torch.bool))
                 self.assertIs(caught.exception, skill.error)
-                events = [json.loads(line) for path in Path(output).rglob("*.jsonl")
-                          for line in path.read_text().splitlines()]
+                events = expanded_events(output)
                 errors = [event for event in events if event["event"] == "execution_error"]
                 self.assertEqual(len(errors), 1)
                 error = errors[0]

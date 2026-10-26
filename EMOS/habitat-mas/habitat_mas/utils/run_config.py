@@ -22,8 +22,10 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_FILES = (
     "habitat-mas/habitat_mas/utils/run_config.py",
     "habitat-mas/habitat_mas/utils/trajectory.py",
+    "habitat-mas/habitat_mas/utils/trajectory_storage.py",
     "habitat-mas/habitat_mas/utils/models.py",
     "habitat-mas/habitat_mas/agents/crab_agent.py",
+    "habitat-baselines/habitat_baselines/run.py",
     "habitat-baselines/habitat_baselines/rl/multi_agent/habitat_mas_evaluator.py",
     "habitat-baselines/habitat_baselines/rl/multi_agent/multi_llm_policy.py",
     "habitat-baselines/habitat_baselines/rl/hrl/hl/llm_policy.py",

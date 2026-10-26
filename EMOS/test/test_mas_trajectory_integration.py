@@ -1,5 +1,7 @@
 """Exercise the MAS evaluation loop without simulator assets or API calls."""
 
+from trajectory_test_utils import read_episode_events, read_trace_summary
+
 import json
 import sys
 import tempfile
@@ -160,8 +162,7 @@ class MASTrajectoryIntegrationTests(unittest.TestCase):
         return envs, policy
 
     def read_episodes(self, output):
-        return [[json.loads(line) for line in path.read_text().splitlines()]
-                for path in sorted(Path(output).rglob("*.jsonl"))]
+        return read_episode_events(output)
 
     def test_records_terminal_state_before_auto_reset_and_scene_identity(self):
         with tempfile.TemporaryDirectory() as output:
@@ -206,7 +207,7 @@ class MASTrajectoryIntegrationTests(unittest.TestCase):
             trace = self.read_episodes(output)[0]
             step = next(event for event in trace if event["event"] == "step")
             self.assertEqual(step["metrics"]["configured_success"], 1.0)
-            summary = json.loads(next(Path(output).rglob("summary.json")).read_text())
+            summary = read_trace_summary(next(Path(output).rglob("summary.json")))
             self.assertEqual(summary["task_success"], 0.0)
             self.assertEqual(summary["termination_reason"], "task_inactive")
 
@@ -214,7 +215,7 @@ class MASTrajectoryIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as output:
             self.run_evaluation(output, [SimpleNamespace(scene_id="a", episode_id="0")],
                                 success_measure=None)
-            summary = json.loads(next(Path(output).rglob("summary.json")).read_text())
+            summary = read_trace_summary(next(Path(output).rglob("summary.json")))
             self.assertIsNone(summary["task_success"])
             self.assertIn("task_success", summary["missing_fields"])
 
@@ -230,7 +231,7 @@ class MASTrajectoryIntegrationTests(unittest.TestCase):
             self.assertTrue(metadata["version"]["source_files"])
             episode_dir = next((run / "episodes").iterdir())
             self.assertEqual(episode_dir.parent, run / "episodes")
-            for filename in ("episode.json", "events.jsonl", "summary.json"):
+            for filename in ("episode.json", "steps.jsonl", "summary.json"):
                 self.assertTrue((episode_dir / filename).is_file())
             events = self.read_episodes(output)[0]
             decision = next(event for event in events if event["event"] == "decision")
@@ -276,7 +277,7 @@ class MASTrajectoryIntegrationTests(unittest.TestCase):
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as output:
                 envs, _ = self.run_evaluation(output, [episode], **flags)
                 self.assertEqual(envs.submitted_actions, [[0]])
-                summary = json.loads(next(Path(output).rglob("summary.json")).read_text())
+                summary = read_trace_summary(next(Path(output).rglob("summary.json")))
                 self.assertEqual(summary["task_success"], 1.0)
 
     def test_trace_directory_error_does_not_prevent_original_task(self):

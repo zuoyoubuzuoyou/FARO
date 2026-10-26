@@ -135,8 +135,9 @@ def main():
                 caught = {"type": type(error).__name__, "message": str(error)}
                 if case != "error":
                     raise
-        events = [json.loads(line) for file in trace.run_dir.rglob("events.jsonl")
-                  for line in file.read_text().splitlines()]
+        from habitat_mas.utils.trajectory_storage import iter_trace_events
+        events = [event for file in trace.run_dir.rglob("steps.jsonl")
+                  for event in iter_trace_events(file)]
         summary = {
             "case": case, "run_dir": str(trace.run_dir),
             "steps": sum(event["event"] == "step" for event in events),

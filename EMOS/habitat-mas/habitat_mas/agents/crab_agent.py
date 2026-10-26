@@ -4,7 +4,7 @@ import json
 
 from .crab_core import Action
 from ..utils.models import OpenAIModel
-from ..utils.trajectory import decision_scope, record_event
+from ..utils.trajectory import current_action_id, decision_scope, record_event
 
 
 REQUEST_TEMPLATE = '"{source_agent}" agent sent you requests: "{request}".'
@@ -58,6 +58,9 @@ class CrabAgent:
         chat_history: Optional[List] = None,
         enable_logging: bool = False,
         logging_file: str = "",
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
     ):
         """This function is a hack to initialize agent after the object is created"""
         self.robot_type = robot_type
@@ -74,6 +77,9 @@ class CrabAgent:
         self.llm_model = OpenAIModel(
             system_message, 
             action_space=self.actions,
+            model=model,
+            temperature=temperature,
+            seed=seed,
             code_execution=self.code_execution,
             enable_logging=enable_logging,
             logging_file=logging_file,
@@ -119,10 +125,146 @@ class CrabAgent:
         with decision_scope(self.name, phase="execution"):
             return self._chat(observation)
 
+    # Explicit allowlists keep runtime clients, skills and simulator handles out
+    # of memory snapshots. Missing fields support partially initialized agents.
+    _REPLAY_AGENT_FIELDS = (
+        "robot_type", "task_description", "subtask_description", "initialized",
+        "start_act", "planner_plan", "_recovery_actions", "_recovery_feedback",
+    )
+    _REPLAY_MODEL_FIELDS = ("chat_history", "system_message", "token_usage")
+    _REPLAY_MODEL_CONFIG = (
+        "model", "window_size", "openai_tools", "actions", "tool_calls_enable",
+        "planning_stage", "code_execution", "temperature", "seed",
+    )
+
+    @staticmethod
+    def _replay_fields(obj, fields):
+        return {name: deepcopy(getattr(obj, name)) for name in fields
+                if hasattr(obj, name)}
+
+    def export_replay_context(self):
+        """Detach decision memory; this is not an environment checkpoint."""
+        return {
+            "schema_version": 1,
+            "agent_name": self.name,
+            "agent_config": {"code_execution": self.code_execution,
+                             "action_prompt": self.action_prompt},
+            "agent_memory": self._replay_fields(self, self._REPLAY_AGENT_FIELDS),
+            "model_present": self.llm_model is not None,
+            "model_config": self._replay_fields(self.llm_model, self._REPLAY_MODEL_CONFIG),
+            "model_memory": self._replay_fields(self.llm_model, self._REPLAY_MODEL_FIELDS),
+            "message_pipe": deepcopy(CrabAgent.message_pipe),
+        }
+
+    def restore_replay_context(self, context):
+        """Restore memory onto compatible existing objects, without model calls.
+
+        The global communication pipe is restored as a whole. Apply contexts in
+        original agent_action event order when reconstructing multiple actors.
+        """
+        if not isinstance(context, dict):
+            raise ValueError("Replay context must be an object")
+        snapshot = deepcopy(context)
+        expected_config = {"code_execution": self.code_execution,
+                           "action_prompt": self.action_prompt}
+        model_config = self._replay_fields(self.llm_model, self._REPLAY_MODEL_CONFIG)
+        saved_model_config = snapshot.get("model_config")
+        if isinstance(saved_model_config, dict):
+            # Earlier contexts omitted these optional request controls. Their
+            # absence matches only an unset current value, including seed=0.
+            model_config = {name: value for name, value in model_config.items()
+                            if name not in ("temperature", "seed") or value is not None
+                            or name in saved_model_config}
+        if (type(snapshot.get("schema_version")) is not int
+                or type(snapshot.get("model_present")) is not bool
+                or snapshot.get("schema_version") != 1
+                or snapshot.get("agent_name") != self.name
+                or snapshot.get("agent_config") != expected_config
+                or snapshot.get("model_present") != (self.llm_model is not None)
+                or saved_model_config != model_config):
+            raise ValueError("Replay context requires compatible agent/model configuration")
+        # Validate every memory key before changing any live state.
+        for key, fields in (("agent_memory", self._REPLAY_AGENT_FIELDS),
+                            ("model_memory", self._REPLAY_MODEL_FIELDS)):
+            if not isinstance(snapshot.get(key), dict) or set(snapshot[key]) - set(fields):
+                raise ValueError("Invalid replay memory fields: " + key)
+        agent_memory = snapshot["agent_memory"]
+        model_memory = snapshot["model_memory"]
+        required_agent_fields = set(self._replay_fields(self, self._REPLAY_AGENT_FIELDS))
+        required_model_fields = set(self._replay_fields(self.llm_model, self._REPLAY_MODEL_FIELDS))
+        if (not required_agent_fields.issubset(agent_memory)
+                or set(model_memory) != required_model_fields
+                or (self.llm_model is None and model_memory)):
+            raise ValueError("Incomplete or model-incompatible replay memory")
+        for name in ("robot_type", "task_description", "subtask_description"):
+            if name in agent_memory and not isinstance(agent_memory[name], str):
+                raise ValueError("Invalid replay text field: " + name)
+        for name in ("initialized", "start_act"):
+            if name in agent_memory and type(agent_memory[name]) is not bool:
+                raise ValueError("Invalid replay boolean field: " + name)
+        if not isinstance(agent_memory.get("planner_plan"), (type(None), str, dict, list, tuple)):
+            raise ValueError("Invalid replay planner memory")
+        feedback = agent_memory.get("_recovery_feedback")
+        if not isinstance(feedback, list) or any(not isinstance(item, str) for item in feedback):
+            raise ValueError("Invalid replay recovery feedback")
+        commands = agent_memory.get("_recovery_actions")
+        if not isinstance(commands, list) or any(
+                not isinstance(command, dict) or not isinstance(command.get("name"), str)
+                or not isinstance(command.get("arguments"), dict) for command in commands):
+            raise ValueError("Invalid replay recovery actions")
+
+        def valid_message(message):
+            # Live snapshots may contain SDK messages; persisted ones contain
+            # their model_dump dictionaries, including nullable content/tools.
+            if not isinstance(message, dict) and callable(getattr(message, "model_dump", None)):
+                message = message.model_dump()
+            if not isinstance(message, dict) or message.get("role") not in (
+                    "system", "developer", "user", "assistant", "tool", "function"):
+                return False
+            content = message.get("content")
+            if content is not None and not isinstance(content, (str, list)):
+                return False
+            if isinstance(content, list) and any(not isinstance(part, dict) for part in content):
+                return False
+            calls = message.get("tool_calls")
+            if calls is not None and (not isinstance(calls, list) or any(
+                    not isinstance(call, dict) for call in calls)):
+                return False
+            return True
+
+        if "chat_history" in model_memory:
+            history = model_memory["chat_history"]
+            if not isinstance(history, list) or any(
+                    not isinstance(group, list) or any(not valid_message(message) for message in group)
+                    for group in history):
+                raise ValueError("Invalid grouped replay history")
+        if "system_message" in model_memory:
+            system = model_memory["system_message"]
+            if not valid_message(system) or system.get("role") != "system":
+                raise ValueError("Invalid replay system message")
+        if "token_usage" in model_memory:
+            usage = model_memory["token_usage"]
+            if type(usage) is not int or usage < 0:
+                raise ValueError("Invalid replay token usage")
+        pipe = snapshot.get("message_pipe")
+        if not isinstance(pipe, dict) or any(
+                not isinstance(name, str) or not isinstance(messages, list)
+                or any(not isinstance(message, str) for message in messages)
+                for name, messages in pipe.items()):
+            raise ValueError("Invalid replay communication pipe")
+        for name, value in snapshot["agent_memory"].items():
+            setattr(self, name, value)
+        for name, value in snapshot["model_memory"].items():
+            setattr(self.llm_model, name, value)
+        CrabAgent.message_pipe = pipe
+
     def _record_action_output(self, output, transformation):
+        memory = {}
+        if current_action_id(self.name) is not None:
+            memory["replay_context"] = self.export_replay_context()
         record_event(
             "agent_action", agent_name=self.name, phase="execution",
-            output=output, transformation=transformation,
+            output=output, transformation=transformation, **memory,
         )
         return output
 

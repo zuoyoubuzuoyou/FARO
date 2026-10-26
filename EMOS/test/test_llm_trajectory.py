@@ -1,5 +1,7 @@
 """Run with habitat's Python; requests use an in-memory OpenAI transport."""
 
+from trajectory_test_utils import read_events as expanded_events
+
 import contextlib
 import copy
 import io
@@ -89,11 +91,7 @@ class LLMTraceTests(unittest.TestCase):
         )
 
     def by_event(self, event_type):
-        events = [
-            json.loads(line)
-            for path in self.trace.run_dir.rglob("*.jsonl")
-            for line in path.read_text().splitlines()
-        ]
+        events = expanded_events(self.trace.run_dir)
         return [event for event in events if event["event"] == event_type]
 
     def first_event(self, event_type):

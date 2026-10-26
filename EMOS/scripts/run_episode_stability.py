@@ -143,6 +143,11 @@ def install_decoding_controls(model_class, settings):
 
 def inspect_trial(trial, settings, returncode, timed_out=False):
     """Validate actual trace evidence; partial native metrics never imply F."""
+    # Prepare/help still work without an installed MAS package. The storage
+    # reader and the package modules imported here use only the standard library.
+    sys.path.insert(0, str(ROOT / "habitat-mas"))
+    from habitat_mas.utils.trajectory_storage import iter_trace_events, read_trace_summary
+
     result = {"status": "recording_error", "task_success": None,
               "returncode": returncode, "finished_at": utc_now()}
     summaries = list(Path(trial["trajectory_dir"]).glob("*/episodes/*/summary.json"))
@@ -152,12 +157,15 @@ def inspect_trial(trial, settings, returncode, timed_out=False):
         if len(summaries) != 1:
             raise ValueError("Expected exactly one recorded episode summary")
         summary_path = summaries[0]
-        summary = json.loads(summary_path.read_text())
-        event_path = summary_path.with_name("events.jsonl")
-        with event_path.open() as stream:
-            for line in stream:
-                if line.strip():
-                    events.append(json.loads(line))
+        summary = read_trace_summary(summary_path)
+        files = summary.get("files") or {}
+        filename = files.get("steps", files.get("events"))
+        if filename is None:
+            filename = "steps.jsonl" if summary_path.with_name("steps.jsonl").exists() else "events.jsonl"
+        event_path = (summary_path.parent / filename).resolve()
+        if event_path.parent != summary_path.parent.resolve():
+            raise ValueError("Episode trace file must remain inside its episode directory")
+        events = list(iter_trace_events(event_path))
         result.update(summary_path=str(summary_path), events_path=str(event_path),
                       run_id=summary.get("run_id"), evaluation_id=summary.get("evaluation_id"),
                       num_env_steps=summary.get("num_env_steps"),
@@ -312,7 +320,6 @@ def worker(spec_path, config_only=False):
     spec = json.loads(Path(spec_path).resolve().read_text())
     settings, trial = spec["settings"], spec["trial"]
     os.environ["CUDA_VISIBLE_DEVICES"] = settings["gpu"]
-    os.environ["EMOS_LLM_MODEL"] = settings["model"]
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     workdir = Path(trial["trial_dir"]) / "workspace"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -329,11 +336,13 @@ def worker(spec_path, config_only=False):
     os.environ.setdefault("MPLCONFIGDIR", str(workdir / "matplotlib"))
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env", override=False)
-    # load_dotenv cannot replace the explicit experiment model.
     from habitat_mas.utils.models import OpenAIModel
     install_decoding_controls(OpenAIModel, settings)
     directory = Path(trial["trial_dir"])
     overrides = [
+        "habitat_baselines.llm_model=" + settings["model"],
+        "habitat_baselines.llm_temperature=" + str(settings["temperature"]),
+        "habitat_baselines.llm_seed=" + str(settings["model_seed"]),
         "habitat.seed=" + str(settings["environment_seed"]),
         "habitat.simulator.seed=" + str(settings["simulator_seed"]),
         "habitat.dataset.data_path=" + trial["dataset_file"],

@@ -1,5 +1,7 @@
 """Exercise live recovery policy commands without a simulator or network."""
 
+from trajectory_test_utils import read_events as expanded_events
+
 import ast
 import contextlib
 from copy import deepcopy
@@ -101,6 +103,9 @@ class EntityDomain:
 
 def make_policy():
     policy = MultiLLMPolicy.__new__(MultiLLMPolicy)
+    policy._llm_model_name = "gpt-5.6-sol"
+    policy._llm_temperature = None
+    policy._llm_seed = None
     policy.should_terminate_on_wait = False
     policy.should_group_discussion = True
     policy.should_agent_reflection = True
@@ -286,8 +291,7 @@ class RecoveryPolicyTests(unittest.TestCase):
             "target_obj": "any_targets|0", "robot": "agent_0"}})
         self.assertEqual(self.agent.llm_model.requests, [])
         self.assertEqual(self.agent.llm_model.chat_history[:len(history)], history)
-        events = [json.loads(line) for path in trace.run_dir.rglob("*.jsonl")
-                  for line in path.read_text().splitlines()]
+        events = expanded_events(trace.run_dir)
         self.assertIn("agent_tool_decision", [event["event"] for event in events])
         self.assertIn("agent_action", [event["event"] for event in events])
         self.assertNotIn("llm_request", [event["event"] for event in events])

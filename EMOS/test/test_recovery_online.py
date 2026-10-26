@@ -1,5 +1,7 @@
 """Exercise recovery at the live evaluator boundary without assets or API calls."""
 
+from trajectory_test_utils import read_events as expanded_events
+
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -121,7 +123,7 @@ class OnlineBridgeTests(unittest.TestCase):
             with EvaluationTrace(output, event_callback=callback) as trace:
                 trace.start_episode(0, SimpleNamespace(scene_id="a", episode_id="0"),
                                     context={"task_description": "actual", "api_key": "private"})
-            records = [json.loads(line) for line in next(Path(output).rglob("*.jsonl")).read_text().splitlines()]
+            records = expanded_events(output)
             self.assertEqual(records[0]["event_type"], "episode_start")
             self.assertEqual(records[0]["context"]["task_description"], "actual")
             self.assertEqual(events[0]["context"]["api_key"], "[REDACTED]")

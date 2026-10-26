@@ -32,6 +32,8 @@ class OpenAIModel:
         logging_file="",
         save_on_each_chat=True,
         agent_name="unknown",
+        temperature=None,
+        seed=None,
     ) -> None:
         self.system_message = {
             "role": "system",
@@ -41,9 +43,9 @@ class OpenAIModel:
         self.action_map = {action.name: action for action in action_space}
         self.chat_history = []
         self.window_size = window_size
-        self.model = model if model is not None else (
-            os.getenv("EMOS_LLM_MODEL", "").strip() or "gpt-5.5"
-        )
+        self.model = model if model is not None else "gpt-5.6-sol"
+        self.temperature = temperature
+        self.seed = seed
         self.client = openai.OpenAI()
         self.planning_stage = discussion_stage
         self.code_execution = code_execution
@@ -109,6 +111,10 @@ class OpenAIModel:
         return result
 
     def _create_completion(self, request, phase, **kwargs):
+        for name in ("temperature", "seed"):
+            value = getattr(self, name, None)
+            if value is not None:
+                kwargs.setdefault(name, value)
         call_id = str(uuid4())
         self._trace_call_id = call_id
         # These values describe only the request we send. Omitted settings are
