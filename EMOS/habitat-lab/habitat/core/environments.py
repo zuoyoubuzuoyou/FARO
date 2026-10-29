@@ -18,6 +18,7 @@ import numpy as np
 
 import habitat
 from habitat import Dataset
+from habitat.core.trajectory_diagnostics import collect_runtime_diagnostics
 from habitat.gym.gym_wrapper import HabGymWrapper
 
 if TYPE_CHECKING:
@@ -114,7 +115,7 @@ class RLTaskEnv(habitat.RLEnv):
             return metrics
         info = dict(metrics)
         try:
-            info["__trajectory_state"] = self.get_trajectory_state()
+            info["__trajectory_state"] = self.get_trajectory_state(observations)
         except Exception as error:
             # Observation-only failures must not interrupt the real step or
             # replace its reward, done flag, metrics, or original exception.
@@ -241,7 +242,7 @@ class RLTaskEnv(habitat.RLEnv):
         omit = object()
         return copy_metric(self._env.get_metrics(), "task_progress")
 
-    def get_trajectory_state(self) -> dict:
+    def get_trajectory_state(self, observations=None) -> dict:
         """Return a detached, JSON-safe snapshot of the current simulator state.
 
         Articulated poses come from robot bases rather than sensor agents.
@@ -326,6 +327,15 @@ class RLTaskEnv(habitat.RLEnv):
             )
         target_objects = self._trajectory_targets(simulator, missing)
         task_progress = self._trajectory_progress(missing)
+        runtime = collect_runtime_diagnostics(
+            simulator=simulator, task=getattr(self._env, "task", None),
+            observations=observations, agent_names=list(agents),
+            target_objects=target_objects, env_step=int(self._env._elapsed_steps),
+            executed_action=executed_action, agent_configs=simulator_config.agents,
+        )
+        for name, diagnostics in runtime["agents"].items():
+            agents[name].update(diagnostics)
+        target_objects = runtime["target_objects"]
         return {
             "episode_id": str(episode.episode_id),
             "scene_id": str(episode.scene_id),
@@ -336,6 +346,7 @@ class RLTaskEnv(habitat.RLEnv):
             "executed_action": self._trajectory_value(executed_action),
             "target_objects": target_objects,
             "task_progress": task_progress,
+            "current_goal": runtime["current_goal"],
             "missing_fields": missing,
         }
 

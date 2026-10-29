@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import torch
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
@@ -135,11 +137,13 @@ class ExecutionCheckpoint:
 class SourceRuntime:
     """Coordinate parent, worker and original files as one reversible revision."""
 
-    def __init__(self, envs=None, root=None, targets=None, persist_source_changes=False):
+    def __init__(self, envs=None, root=None, targets=None, persist_source_changes=False,
+                 restricted=False):
         self.envs = envs
         self.root = Path(root or REPOSITORY_ROOT).resolve()
         self.targets = targets
         self.persist_source_changes = bool(persist_source_changes)
+        self.restricted = bool(restricted)
         self._parent_patcher = None
         self._active = []
         self._consistency_error = None
@@ -147,8 +151,17 @@ class SourceRuntime:
     def _patcher(self):
         if self._parent_patcher is None:
             from .source_patch import RuntimeSourcePatcher
-            self._parent_patcher = RuntimeSourcePatcher(self.root, targets=self.targets)
+            self._parent_patcher = RuntimeSourcePatcher(
+                self.root, targets=self.targets, restricted=self.restricted)
+        elif self.restricted:
+            self._parent_patcher.restricted = True
         return self._parent_patcher
+
+    def require_restricted_patches(self):
+        """Pin automatic recovery validation, including an already cached host."""
+        self.restricted = True
+        if self._parent_patcher is not None:
+            self._parent_patcher.restricted = True
 
     @staticmethod
     def _require(result, expected, location):
@@ -169,6 +182,25 @@ class SourceRuntime:
         checkpoint = ExecutionCheckpoint(policy)
         parent = transaction.manifest("parent")
         worker = transaction.manifest("worker")
+        if self.restricted:
+            if not getattr(transaction, "restricted", False):
+                raise RuntimeError("Restricted source runtime requires a restricted transaction profile")
+            if worker["files"]:
+                from .source_execution_guard import execution_target
+                if not isinstance(worker["files"], list):
+                    raise RuntimeError("Restricted worker manifest requires a list of execution source files")
+                for file in worker["files"]:
+                    if (not isinstance(file, dict) or file.get("process") != "worker"
+                            or not isinstance(file.get("path"), str)
+                            or not isinstance(file.get("changes"), list) or not file["changes"]):
+                        raise RuntimeError("Restricted worker manifest requires allowlisted execution methods")
+                    for change in file["changes"]:
+                        if not isinstance(change, dict) or not isinstance(change.get("target"), str):
+                            raise RuntimeError("Restricted worker manifest requires allowlisted execution methods")
+                        specification = execution_target(file["path"], change["target"])
+                        if specification is None or specification.get("process") != "worker":
+                            raise RuntimeError("Restricted worker source method is not allowlisted: "
+                                               + change["target"])
         parent_installed = worker_installed = False
         try:
             entrypoint = transaction.entrypoint
@@ -197,7 +229,10 @@ class SourceRuntime:
                                        + ", ".join(result["pending_modules"]))
             transaction.commit_files()
             method = target.rsplit(".", 1)[-1]
-            result = getattr(policy, method)(context)
+            # Sampled recovery runs after the evaluator's policy inference
+            # scope. Its existing control flags can still be inference tensors.
+            with torch.inference_mode():
+                result = getattr(policy, method)(context)
             try:
                 serialized = json.dumps(result, allow_nan=False, ensure_ascii=False)
             except (TypeError, ValueError, OverflowError, RecursionError) as result_error:
@@ -210,7 +245,8 @@ class SourceRuntime:
         except Exception as error:
             failures = self._undo(transaction, parent_installed, worker_installed)
             try:
-                checkpoint.restore()
+                with torch.inference_mode():
+                    checkpoint.restore()
             except Exception as restore_error:
                 failures.append("Control state rollback: " + str(restore_error))
             detail = str(error)

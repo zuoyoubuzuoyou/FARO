@@ -24,7 +24,8 @@ class StepStorageTest(unittest.TestCase):
         return dict(self.identity, schema_version=2, sequence=seq, event_id=str(seq), event_type=kind, **data)
 
     def test_exact_expansion_order_state_and_literal_refs(self):
-        state = {'task_progress': {'success': False}, 'executed_action': {'name': 'move'}, 'unknown': None}
+        state = {'task_progress': {'success': False}, 'executed_action': {'name': 'move'},
+                 'unknown': None, 'evidence': 'native diagnostic evidence ' * 20}
         events = [self.event(0, 'episode_start', state={'initial': True}),
                   self.event(1, 'llm_request', messages=[{'content': 'long text ' * 80}], literal={'$trace': ['blob', 'bad']}),
                   self.event(2, 'env_action_submit', action=[1, 0]),

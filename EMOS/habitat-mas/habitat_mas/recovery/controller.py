@@ -2,6 +2,7 @@
 from collections import deque
 from copy import deepcopy
 import json
+import logging
 import math
 from pathlib import Path
 
@@ -12,6 +13,15 @@ from .config import RecoveryConfig
 from .context import build_context, source_snapshot
 from .generator import RecoveryGenerator
 from .program import RecoveryProgram
+
+
+_LOG = logging.getLogger("habitat_mas.recovery")
+if not _LOG.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    _LOG.addHandler(_handler)
+_LOG.setLevel(logging.INFO)
+_LOG.propagate = False
 
 
 def _write(path, value):
@@ -82,6 +92,39 @@ class RecoveryController:
         row = redact({"event": event, "step": self._last_step, **data})
         with (self.output_dir / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        # Exclude request/source/context fields from console diagnostics; only
+        # event metadata and a bounded, redacted error first line are shown.
+        visible = {"detection", "generation_started", "generation_rejected", "application",
+                   "source_generation_started", "source_generation_rejected", "source_application",
+                   "source_unrepairable", "verification", "source_budget_exhausted",
+                   "execution_exception", "source_rollback", "source_consistency_error", "rollback"}
+        if event not in visible:
+            return
+        summary = [event]
+        for name in ("step", "iteration", "status", "attempts"):
+            if name in row:
+                summary.append("%s=%s" % (name, row[name]))
+        if event == "detection":
+            decision = row.get("decision") or {}
+            prediction = decision.get("system_error")
+            if isinstance(prediction, bool):
+                summary.append("system_error=%s" % prediction)
+            elif decision.get("status") in {"normal", "system_error"}:
+                summary.append("system_error=%s" % (decision["status"] == "system_error"))
+            else:
+                summary.append("decision_status=%s" % decision.get("status", "unknown"))
+        result = row.get("result")
+        if isinstance(result, dict) and "status" in result:
+            summary.append("result_status=%s" % result["status"])
+        if row.get("error"):
+            error = row["error"]
+            if isinstance(error, dict):
+                error = "%s: %s" % (error.get("type", "Error"), error.get("message", ""))
+            summary.append("error=%s" % str(error).splitlines()[0][:200])
+        level = logging.WARNING if ("rejected" in event or event in {
+            "source_budget_exhausted", "source_unrepairable", "execution_exception",
+            "source_rollback", "source_consistency_error", "rollback"}) else logging.INFO
+        _LOG.log(level, "Recovery %s", " ".join(summary))
 
     def _save_version(self, version):
         _write(self.output_dir / "versions" / ("%03d" % version["iteration"]) / "version.json", version)
@@ -196,6 +239,9 @@ class RecoveryController:
         for key in self._pending_events:
             clean[key], self._pending_events[key] = self._pending_events[key], []
         self._recent.append(deepcopy(clean))
+        return self._observe_sample(clean, policy)
+
+    def _observe_sample(self, clean, policy):
         decision = self.detector.observe(clean)
         if decision:
             self._event("detection", decision=decision)

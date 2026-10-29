@@ -14,12 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "habitat-mas"))
 
 
-def answer(status="normal", evidence=None, **updates):
-    value = {
-        "status": status, "reason_code": "observed_progress",
-        "explanation": "队友正在正常前往目标。", "agents": ["agent_0"],
-        "evidence": [] if evidence is None else evidence, "confidence": 0.8,
-    }
+def answer(system_error=False, **updates):
+    value = {"system_error": system_error}
     value.update(updates)
     return value
 
@@ -185,72 +181,36 @@ class LLMDetectionTests(unittest.TestCase):
         self.assertEqual(monitor.observe(frame(0))["status"], "normal")
         self.assertEqual(monitor.stats["total_tokens"], 18)
 
-    def test_alarm_requires_actual_window_evidence_and_preserves_model_decision(self):
-        monitor, _ = self.detector(answer("system_error", [{"step": 50, "observation": "不再移动"}]), window=2)
+    def test_boolean_alarm_gets_program_step_without_fabricating_model_details(self):
+        monitor, _ = self.detector(answer(True), window=2)
         monitor.observe(frame(0))
         result = monitor.observe(frame(50))
-        self.assertEqual(result["status"], "system_error")
-        self.assertEqual(result["step"], 50)
-        self.assertEqual(result["detector"], "llm")
-        self.assertEqual(result["evidence"][0]["step"], 50)
+        self.assertEqual(result, {"system_error": True, "status": "system_error",
+                                  "step": 50, "detector": "llm"})
         self.assertEqual(monitor.stats["system_error"], 1)
 
-    def test_alarm_can_cite_real_decision_or_message_steps_inside_sampled_frames(self):
-        for field, event, event_step in [
-                ("decisions", {"agent": "agent_0", "tool": "wait", "step": 17}, 17),
-                ("messages", {"kind": "receive", "sender": "agent_0", "recipient": "agent_0",
-                              "message": "Please retry the unfinished task.", "step": 23}, 23)]:
-            with self.subTest(field=field):
-                monitor, _ = self.detector(answer("system_error", [
-                    {"step": event_step, "observation": "该观测中保留了真实协作事件。"}]), window=2)
-                monitor.observe(frame(0))
-                result = monitor.observe(frame(50, **{field: [event]}))
-                self.assertEqual(result["status"], "system_error")
-                self.assertEqual(result["evidence"][0]["step"], event_step)
+    def test_boolean_false_is_a_valid_negative_without_extra_output_fields(self):
+        monitor, _ = self.detector(answer(False), window=1)
+        self.assertEqual(monitor.observe(frame(0)), {
+            "system_error": False, "status": "normal", "step": 0, "detector": "llm"})
+        self.assertEqual(monitor.stats["normal"], 1)
 
-    def test_nested_event_evidence_rejects_future_unseen_and_noninteger_steps(self):
-        cases = [
-            ("decisions", {"agent": "agent_0", "tool": "wait", "step": 51}, 51),
-            ("messages", {"sender": "agent_0", "message": "future", "step": 51}, 51),
-            ("decisions", {"agent": "agent_0", "tool": "wait", "step": "17"}, 17),
-            ("decisions", {"agent": "agent_0", "tool": "wait", "step": 17.0}, 17),
-            ("messages", {"sender": "agent_0", "message": "negative", "step": -1}, -1),
-            ("messages", {"sender": "agent_0", "message": "boolean", "step": True}, 1),
-            ("decisions", {"agent": "agent_0", "tool": "wait", "step": 23}, 17),
-            ("messages", {"sender": "agent_0", "message": "We discussed step 17."}, 17),
-        ]
-        for field, event, citation in cases:
-            with self.subTest(field=field, event=event, citation=citation):
-                monitor, _ = self.detector(answer("system_error", [
-                    {"step": citation, "observation": "不能引用未实际提供的事件步。"}]), window=2)
-                monitor.observe(frame(0))
-                result = monitor.observe(frame(50, **{field: [event]}))
-                self.assertEqual(result["status"], "error")
-                self.assertEqual(result["reason_code"], "invalid_response")
+    def test_boolean_result_still_receives_original_decisions_and_messages(self):
+        monitor, api = self.detector(answer(True), window=2)
+        decision = {"agent": "agent_0", "tool": "wait", "step": 17}
+        message = {"sender": "agent_1", "recipient": "agent_0", "message": "retry", "step": 23}
+        monitor.observe(frame(0))
+        result = monitor.observe(frame(50, decisions=[decision], messages=[message]))
+        self.assertTrue(result["system_error"])
+        recent = json.loads(api.requests[0]["messages"][1]["content"])["recent_frames"]
+        self.assertEqual(recent[-1]["decisions"][0]["step"], 17)
+        self.assertEqual(recent[-1]["messages"][0], message)
 
-    def test_event_step_is_valid_only_while_its_carrying_frame_remains_in_window(self):
-        citation = answer("system_error", [{"step": 17, "observation": "已提供的较早决策。"}])
-        monitor, _ = self.detector(citation, citation, window=2, check_every=1)
-        monitor.observe(frame(50, decisions=[{"agent": "agent_0", "tool": "wait", "step": 17}]))
-        self.assertEqual(monitor.observe(frame(100))["status"], "system_error")
-        # Step17 is no longer in the submitted window after its frame ages out.
-        self.assertEqual(monitor.observe(frame(150))["status"], "error")
-
-    def test_evidence_requires_a_nonempty_factual_observation(self):
-        for evidence in [[{"step": 0}], [{"step": 0, "observation": "  "}],
-                         [{"step": 0, "observation": 12}]]:
-            with self.subTest(evidence=evidence):
-                monitor, _ = self.detector(answer("system_error", evidence), window=1)
-                result = monitor.observe(frame(0))
-                self.assertEqual(result["status"], "error")
-                self.assertEqual(result["reason_code"], "invalid_response")
-
-    def test_invalid_json_and_invalid_evidence_are_errors_not_normal(self):
-        invalid = ["```json\n{}\n```", answer("system_error"),
-                   answer("system_error", [{"step": 999}]),
-                   answer("system_error", [{"step": True}]),
-                   answer("failure"), answer(confidence=1.1),
-                   answer(confidence=True), answer(agents=["unknown_robot"])]
+    def test_nonboolean_or_extra_output_fields_are_errors_not_normal(self):
+        invalid = ["not json", "true", "false", "null", "[]", "{}",
+                   answer(None), answer(0), answer(1), answer("false"), answer("true"),
+                   answer(False, explanation="extra"), answer(True, confidence=0.9),
+                   {"status": "normal"}, {"status": "uncertain"}]
         for value in invalid:
             with self.subTest(value=value):
                 monitor, _ = self.detector(value, window=1)
@@ -259,6 +219,7 @@ class LLMDetectionTests(unittest.TestCase):
                 self.assertEqual(result["reason_code"], "invalid_response")
                 self.assertEqual(monitor.stats["errors"], 1)
                 self.assertEqual(monitor.stats["normal"], 0)
+                self.assertNotIn("system_error", result)
 
     def test_timeout_remains_error_and_next_window_can_still_be_checked(self):
         monitor, _ = self.detector(TimeoutError("read timed out"), answer(),
@@ -267,12 +228,6 @@ class LLMDetectionTests(unittest.TestCase):
         self.assertEqual(monitor.observe(frame(1))["status"], "normal")
         self.assertEqual(monitor.stats["requests"], 2)
         self.assertEqual(monitor.stats["errors"], 1)
-
-    def test_uncertain_is_distinct_from_normal(self):
-        monitor, _ = self.detector(answer("uncertain"), window=1)
-        self.assertEqual(monitor.observe(frame(0))["status"], "uncertain")
-        self.assertEqual(monitor.stats["uncertain"], 1)
-        self.assertEqual(monitor.stats["normal"], 0)
 
     def test_cache_resume_reuses_only_identical_prompt_model_and_context(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -308,9 +263,9 @@ class LLMDetectionTests(unittest.TestCase):
             first, _ = self.detector(answer(), window=1, cache_dir=directory)
             first.client.base_url = "https://provider-a.invalid/v1"
             self.assertEqual(first.observe(frame(0))["status"], "normal")
-            second, _ = self.detector(answer("uncertain"), window=1, cache_dir=directory)
+            second, _ = self.detector(answer(True), window=1, cache_dir=directory)
             second.client.base_url = "https://provider-b.invalid/v1"
-            self.assertEqual(second.observe(frame(0))["status"], "uncertain")
+            self.assertEqual(second.observe(frame(0))["status"], "system_error")
             self.assertEqual(second.stats["requests"], 1)
             self.assertEqual(second.stats["cache_hits"], 0)
             self.assertEqual(len(list(Path(directory).glob("*.json"))), 2)
@@ -354,8 +309,8 @@ class LLMDetectionTests(unittest.TestCase):
             monitor.observe(frame(0))
             path = next(Path(directory).glob("*.json"))
             path.write_text("broken", encoding="utf-8")
-            second, _ = self.detector(answer("uncertain"), window=1, cache_dir=directory)
-            self.assertEqual(second.observe(frame(0))["status"], "uncertain")
+            second, _ = self.detector(answer(True), window=1, cache_dir=directory)
+            self.assertEqual(second.observe(frame(0))["status"], "system_error")
             self.assertEqual(second.stats["cache_hits"], 0)
             self.assertEqual(second.stats["requests"], 1)
 
@@ -386,7 +341,7 @@ class LLMDetectionTests(unittest.TestCase):
             self.assertNotIn(secret, text)
             self.assertNotIn("user:password", text)
             row = json.loads(text)
-            self.assertEqual(row["status"], "normal")
+            self.assertEqual(row["status"], "error")
             self.assertEqual(row["request"]["model"], "gpt-6-sol")
             self.assertEqual(row["response"]["model"], "served-model")
             self.assertEqual(row["usage"]["total_tokens"], 18)

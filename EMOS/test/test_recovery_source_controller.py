@@ -146,7 +146,7 @@ class SourceControllerTests(unittest.TestCase):
         with fixture() as (root, policy, runtime):
             generator = Revisions([("MultiLLMPolicy.Resume", RESUME)],
                 [("MultiLLMPolicy.Resume", RESUME), ("MultiLLMPolicy.act", replacement)])
-            controller = self.controller(root, runtime, generator)
+            controller = self.controller(root, runtime, generator, max_iterations=2)
             controller.observe(frame(0), policy)
             controller.observe(frame(1), policy)
             self.assertEqual(policy.act(), "fly")
@@ -181,7 +181,7 @@ class SourceControllerTests(unittest.TestCase):
         with fixture() as (root, policy, runtime):
             generator = Revisions([("MultiLLMPolicy.Resume", RESUME), ("MultiLLMPolicy.act", failing_act)],
                 [("MultiLLMPolicy.Resume", RESUME), ("MultiLLMPolicy.act", fixed_act)])
-            controller = self.controller(root, runtime, generator)
+            controller = self.controller(root, runtime, generator, max_iterations=2)
             controller.observe(frame(0), policy)
             result = controller.handle_execution_error(frame(0), policy, RuntimeError("new method broke"))
             self.assertEqual(result["status"], "applied")

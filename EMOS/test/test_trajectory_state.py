@@ -2,6 +2,7 @@
 
 import ast
 import json
+import importlib.util
 import math
 import pickle
 import unittest
@@ -50,7 +51,11 @@ def _load_rl_task_env():
         ],
         type_ignores=[],
     )
-    namespace = {"habitat": habitat}
+    helper_path = source.with_name("trajectory_diagnostics.py")
+    helper_spec = importlib.util.spec_from_file_location("trajectory_diagnostics", helper_path)
+    helper = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(helper)
+    namespace = {"habitat": habitat, "collect_runtime_diagnostics": helper.collect_runtime_diagnostics}
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     return namespace["RLTaskEnv"]
 
@@ -192,7 +197,7 @@ class TrajectoryStateTest(unittest.TestCase):
         self.assertNotIn("__trajectory_state", env._env.get_metrics())
         state = info["__trajectory_state"]
         self.assertEqual(
-            {key: value for key, value in state.items() if key != "agents"},
+            {key: value for key, value in state.items() if key not in ("agents", "current_goal")},
             {
                 "episode_id": "episode-7",
                 "scene_id": "scene/path.glb",
@@ -210,7 +215,9 @@ class TrajectoryStateTest(unittest.TestCase):
         )
         self.assertEqual(list(state["agents"]), ["agent_1", "agent_0"])
         self.assertEqual(
-            state["agents"],
+            {name: {key: value for key, value in agent.items()
+                    if key not in ("goal_coverage", "detection", "root_position", "root_position_reason", "camera_sensors")}
+             for name, agent in state["agents"].items()},
             {
                 "agent_1": {
                     "robot_type": "DJIDrone",
@@ -248,8 +255,10 @@ class TrajectoryStateTest(unittest.TestCase):
 
         self.assertEqual(state["target_objects"], [
             {"scene_index": 2, "object_id": 43, "handle": "obj-43",
+             "goal_name": "any_targets|0", "semantic_id": None,
              "position": [7.0, 8.0, 9.0], "goal_position": [10.0, 11.0, 12.0]},
             {"scene_index": 0, "object_id": 41, "handle": "obj-41",
+             "goal_name": "any_targets|1", "semantic_id": None,
              "position": [1.0, 2.0, 3.0], "goal_position": [13.0, 14.0, 15.0]},
         ])
         self.assertNotIn("visual", state["task_progress"])

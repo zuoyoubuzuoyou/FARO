@@ -18,6 +18,9 @@ from habitat.tasks.rearrange.actions.actions import (
 )
 from habitat.tasks.rearrange.utils import place_agent_at_dist_from_pos
 from habitat.tasks.utils import get_angle
+from habitat.tasks.rearrange.actions.navigation_diagnostics import (
+    _record_navigation_diagnostics,
+)
 from habitat_sim.physics import VelocityControl
 from habitat.tasks.rearrange.actions.oracle_nav_action import (
     OracleNavAction,
@@ -257,6 +260,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
         )
 
     def reset(self, *args, **kwargs):
+        _record_navigation_diagnostics(self, phase="reset")
         super().reset(*args, **kwargs)
         self.prev_nav_done = False
         self.skill_done = False
@@ -267,6 +271,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
 
     def _get_target_for_idx(self, nav_to_target_idx: int):
         if nav_to_target_idx not in self._targets:
+            _record_navigation_diagnostics(self, phase="cache_miss")
             nav_to_obj = self._poss_entities[nav_to_target_idx]
             obj_pos = self._task.pddl_problem.sim_info.get_entity_pos(
                 nav_to_obj
@@ -288,6 +293,8 @@ class OracleNavDiffBaseAction(OracleNavAction):
                 np.array(start_pos),
                 np.array(obj_pos),
             )
+        else:
+            _record_navigation_diagnostics(self, phase="cache_hit")
         return self._targets[nav_to_target_idx]
 
     def _path_to_point(self, point, pathfinder=None):
@@ -307,11 +314,13 @@ class OracleNavDiffBaseAction(OracleNavAction):
             found_path = self.pathfinder.find_path(path)
         else:
             found_path = pathfinder.find_path(path)
+        _record_navigation_diagnostics(self, locals(), phase="path")
         if not found_path:
             return [agent_pos, point]
         return path.points
 
     def step(self, *args, **kwargs):
+        _record_navigation_diagnostics(self)
         # Get episode id
         ep_id = self._sim.ep_info.episode_id
 
@@ -325,6 +334,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
             self._action_arg_prefix + "oracle_nav_action"
         ]
 
+        _record_navigation_diagnostics(self, locals(), phase="input")
         if self.prev_nav_done and int(nav_to_target_idx[0]) - 1 == self.prev_match_target_id:
             nav_to_target_idx = 0
         if nav_to_target_idx <= 0 or nav_to_target_idx > len(
@@ -336,6 +346,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
         final_nav_targ, obj_targ_pos = self._get_target_for_idx(
             nav_to_target_idx
         )
+        _record_navigation_diagnostics(self, locals(), phase="target")
         base_T = self.cur_articulated_agent.base_transformation
         curr_path_points = self._path_to_point(final_nav_targ)
         robot_pos = np.array(self.cur_articulated_agent.base_pos)
@@ -403,6 +414,8 @@ class OracleNavDiffBaseAction(OracleNavAction):
                 and angle_to_obj < self._config.turn_thresh
             )
 
+            _record_navigation_diagnostics(self, locals(), phase="geometry")
+
             if self.motion_type == "base_velocity":
                 if not at_goal:
                     if dist_to_final_nav_targ < self._config.dist_thresh:
@@ -425,6 +438,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
                     self.prev_nav_done = True
                     self.prev_match_target_id = nav_to_target_idx
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 BaseVelAction.step(self, *args, **kwargs)
                 return
 
@@ -450,6 +464,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
                     self.prev_nav_done = True
                     self.prev_match_target_id = nav_to_target_idx
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 BaseVelNonCylinderAction.step(self, *args, **kwargs)
                 return
 
@@ -479,6 +494,7 @@ class OracleNavDiffBaseAction(OracleNavAction):
                     base_action
                 )
 
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 HumanoidJointAction.step(self, *args, **kwargs)
                 return
             else:

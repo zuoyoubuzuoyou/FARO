@@ -181,7 +181,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_next_generation_receives_previous_code_and_progress_feedback(self):
         with tempfile.TemporaryDirectory() as directory:
-            monitor, _, generator = self.setup_controller(directory, codes=(RESUME, MOVE))
+            monitor, _, generator = self.setup_controller(directory, codes=(RESUME, MOVE), max_iterations=2)
             policy = Policy()
             monitor.observe(frame(0), policy)
             monitor.observe(frame(1), policy)
@@ -193,7 +193,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_bad_revision_does_not_replace_previous_code(self):
         with tempfile.TemporaryDirectory() as directory:
-            monitor, _, _ = self.setup_controller(directory, codes=(RESUME, "import os"))
+            monitor, _, _ = self.setup_controller(directory, codes=(RESUME, "import os"), max_iterations=2)
             policy = Policy()
             monitor.observe(frame(0), policy)
             monitor.observe(frame(1), policy)
@@ -221,7 +221,7 @@ class ControllerTests(unittest.TestCase):
     return {"commands": [], "memory": {"revision": 2}}
 '''
         with tempfile.TemporaryDirectory() as directory:
-            monitor, detector, _ = self.setup_controller(directory, codes=(RESUME, bad_later))
+            monitor, detector, _ = self.setup_controller(directory, codes=(RESUME, bad_later), max_iterations=2)
             policy = Policy()
             monitor.observe(frame(0), policy)
             monitor.observe(frame(2), policy)

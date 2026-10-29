@@ -266,6 +266,10 @@ class _EpisodeWriter:
         self.pending_actions = {}
         self.deferred_ends = {}
         self.last_actions = {}
+        self.action_observations = {}
+        self.prepared_outcomes = {}
+        self.last_outcomes = {}
+        self.placeholder_calls = {}
         self.submissions = {}
         self.media = []
         self.exception_count = 0
@@ -439,7 +443,47 @@ class _EpisodeWriter:
                 # or strand the next step behind an uncommitted packet.
                 self.logging_error_count += 1
                 _LOG.warning("Trajectory observer failed (%s): %s", type(error).__name__, redact(str(error)))
+        if event_type == "tool_response_placeholder" and agent_id is not None:
+            call_id = payload.get("tool_call_id")
+            if isinstance(call_id, str):
+                self.placeholder_calls[(agent_id, call_id)] = {
+                    "action_id": action_id, "content": payload.get("content"),
+                }
+        elif event_type == "llm_request" and payload.get("phase") == "execution" and agent_id is not None:
+            # Audit the real request after it has been captured. This never
+            # replaces the original tool messages or injects task feedback.
+            _guard(self._execution_feedback, payload)
         return payload
+
+    def _execution_feedback(self, request):
+        agent_id = request["agent_id"]
+        previous = self.last_outcomes.get(agent_id)
+        messages = request.get("messages") or []
+        feedback = []
+        user_message = None
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user":
+                user_message = message.get("content")
+            elif message.get("role") == "tool":
+                call_id = message.get("tool_call_id")
+                placeholder = self.placeholder_calls.get((agent_id, call_id))
+                feedback.append({"tool_call_id": call_id, "name": message.get("name"),
+                                 "content": message.get("content"),
+                                 "is_placeholder": True if placeholder is not None else None})
+        summary = None if previous is None else {
+            key: previous.get(key) for key in (
+                "action_id", "observation_env_step", "status", "reason", "actual_execution_observed")}
+        self.write("execution_feedback", request["env_step"], agent_id=agent_id,
+                   phase="execution", call_id=request.get("call_id"),
+                   preceding_action_id=previous.get("action_id") if previous else None,
+                   outcome_env_step=previous.get("env_step") if previous else None,
+                   observation_env_step=previous.get("observation_env_step") if previous else None,
+                   actual_execution_observed=bool(previous and previous.get("actual_execution_observed")),
+                   feedback_source="model_request_messages",
+                   model_feedback={"tool_messages": feedback, "user_message": user_message},
+                   preceding_outcome=summary)
 
     def begin_action(self, agent_id, name, parameters, step, **data):
         if agent_id in self.active_actions:
@@ -451,17 +495,45 @@ class _EpisodeWriter:
         self.write("action_start", step, agent_name=agent_id, **data, **action)
         return action["action_id"]
 
-    def _finish_action(self, agent_id, status, reason, result, step):
+    def _finish_action(self, agent_id, status, reason, result, step, signal_step=None):
         action = self.active_actions.pop(agent_id, None)
         if action is None:
             return
         action = {**action, "status": status, "reason": reason, "result": result}
         self.last_actions[agent_id] = action
         self.write("action_end", step, agent_name=agent_id, **action)
+        self._record_action_outcome(agent_id, action, status, reason, result, step, signal_step)
+        self.action_observations.pop(action["action_id"], None)
+        self.prepared_outcomes.pop(action["action_id"], None)
+        deferred = self.deferred_ends.get(agent_id)
+        if deferred is not None and deferred[0] == action["action_id"]:
+            self.deferred_ends.pop(agent_id, None)
+
+    def _record_action_outcome(self, agent_id, action, status, reason, result, step, signal_step=None):
+        if action["action_id"] in self.prepared_outcomes:
+            return
+        observed = self.action_observations.get(action["action_id"])
+        # An initial snapshot or a newer controller's state is not evidence
+        # that this action actually received an environment transition.
+        outcome = self.write("action_outcome", step, agent_id=agent_id,
+            action_id=action["action_id"], decision_step=action.get("decision_step"),
+            action_name=action.get("action_name"), started_step=action.get("started_step"),
+            status=status, reason=reason, controller_result=result,
+            termination_signal_step=step if signal_step is None else signal_step,
+            observation_env_step=observed["step"] if observed else None,
+            actual_execution_observed=observed is not None, is_placeholder=False,
+            state=observed["state"] if observed else None,
+            metrics=observed["metrics"] if observed else None,
+            missing_reason=None if observed else "No returned environment step was observed for this action")
+        self.last_outcomes[agent_id] = outcome
+        self.prepared_outcomes[action["action_id"]] = outcome
 
     def end_action(self, agent_id, status, reason, result, step, defer):
+        action = self.active_actions.get(agent_id)
+        if action is None:
+            return
         if defer:
-            self.deferred_ends[agent_id] = (status, reason, result)
+            self.deferred_ends[agent_id] = (action["action_id"], status, reason, result, step)
         else:
             self._finish_action(agent_id, status, reason, result, step)
 
@@ -486,6 +558,24 @@ class _EpisodeWriter:
 
     def record_step(self, action, reward, done, metrics, state, success=None, termination_reason=None):
         step = self.num_steps + 1
+        # env.step has already returned. Publish its real end observations
+        # before the step event, so streaming consumers see them in that same
+        # frame, including the terminal frame. action_end keeps its original
+        # post-step ordering and cannot emit the outcome twice.
+        observed = self.prepare({"step": step, "state": state, "metrics": metrics})
+        for active in self.active_actions.values():
+            self.action_observations[active["action_id"]] = observed
+        for agent_id, (action_id, status, reason, result, signal_step) in list(self.deferred_ends.items()):
+            active = self.active_actions.get(agent_id)
+            if active is not None and active["action_id"] == action_id:
+                self._record_action_outcome(agent_id, active, status, reason,
+                    result if result is not None else {"metrics": observed["metrics"], "state": observed["state"]},
+                    step, signal_step)
+        if done:
+            reason = termination_reason or (state or {}).get("termination_reason") or "completed"
+            for agent_id, active in self.active_actions.items():
+                self._record_action_outcome(agent_id, active, "episode_terminated", reason,
+                    {"state": observed["state"], "metrics": observed["metrics"], "error": None}, step)
         payload = self.write("step", step, action=action, reward=reward,
                              done=bool(done), metrics=metrics, state=state)
         self.num_steps = step
@@ -499,9 +589,13 @@ class _EpisodeWriter:
                        state=state.get("agents", {}).get(agent_id) if state else None,
                        executed_action=state.get("executed_action") if state else None)
         self.submissions.clear()
-        for agent_id, (status, reason, result) in list(self.deferred_ends.items()):
+        for agent_id, (action_id, status, reason, result, signal_step) in list(self.deferred_ends.items()):
+            active = self.active_actions.get(agent_id)
+            if active is None or active["action_id"] != action_id:
+                continue
             self._finish_action(agent_id, status, reason,
-                                result if result is not None else {"metrics": self.metrics, "state": self.state}, step)
+                                result if result is not None else {"metrics": self.metrics, "state": self.state},
+                                step, signal_step=signal_step)
         self.deferred_ends.clear()
         if done:
             self.success = _json_value(success)

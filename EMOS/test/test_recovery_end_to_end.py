@@ -39,10 +39,7 @@ class Transport:
         self.requests.append(deepcopy(request))
         data = json.loads(request["messages"][1]["content"])
         if "recent_frames" in data:
-            decision = {"status": "system_error", "reason_code": "no_team_progress",
-                "explanation": "team remains waiting", "agents": ["agent_0"],
-                "evidence": [{"step": data["recent_frames"][-1]["step"], "observation": "waiting"}],
-                "confidence": .9}
+            decision = {"system_error": True}
         else:
             decision = {"code": CODE, "explanation": "add a stateful redirection branch"}
         return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(decision)}}]}
@@ -52,7 +49,8 @@ class EndToEndRecoveryTest(unittest.TestCase):
     def test_invalid_generated_target_is_rejected_before_interrupting_any_agent(self):
         class Alarm:
             def observe(self, frame):
-                return {"status": "system_error", "evidence": [{"step": frame["step"], "observation": "stalled"}]}
+                return {"step": frame["step"], "detector": "llm",
+                    "system_error": True, "status": "system_error"}
         class InvalidTarget:
             def generate(self, context):
                 return {"code": CODE.replace("any_targets|0", "NONEXISTENT_ENTITY"), "explanation": "invalid candidate"}
@@ -94,6 +92,7 @@ class EndToEndRecoveryTest(unittest.TestCase):
                 step(0, 2)
                 self.assertEqual(len(transport.requests), 0)  # A full window is required.
                 result = step(0, 2)
+                self.assertIsNotNone(result[0], "A boolean system error alarm must trigger recovery")
                 self.assertEqual(result[0]["status"], "applied")
                 with trace.policy_step():
                     decision = agent.chat("same room, still holding object42")
@@ -106,6 +105,8 @@ class EndToEndRecoveryTest(unittest.TestCase):
                 self.assertEqual(controllers[0].versions[0]["outcomes"][0]["status"], "progress_observed")
                 self.assertEqual(len(controllers), 1)
                 context = json.loads(next((Path(output) / "recovery").rglob("context.json")).read_text())
+                self.assertEqual(context["error_report"], {
+                    "step": 2, "detector": "llm", "system_error": True, "status": "system_error"})
                 self.assertEqual(context["runtime"]["current_frame"]["agents"]["agent_0"]["held_object"], 42)
                 self.assertEqual(context["planner_plan"]["agent_0"], "navigate, pick, navigate, place")
                 self.assertEqual(len(context["recent_history"]["agent_0"]), 10)

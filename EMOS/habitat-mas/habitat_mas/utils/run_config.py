@@ -32,6 +32,12 @@ _SOURCE_FILES = (
     "habitat-baselines/habitat_baselines/rl/hrl/hierarchical_policy.py",
     "habitat-baselines/habitat_baselines/rl/hrl/skills/skill.py",
     "habitat-lab/habitat/core/environments.py",
+    "habitat-lab/habitat/core/trajectory_diagnostics.py",
+    "habitat-lab/habitat/tasks/rearrange/actions/navigation_diagnostics.py",
+    "habitat-lab/habitat/tasks/rearrange/actions/oracle_nav_action.py",
+    "habitat-lab/habitat/tasks/rearrange/actions/habitat_mas_actions.py",
+    "habitat-lab/habitat/tasks/rearrange/multi_task/pddl_sim_state.py",
+    "habitat-lab/habitat/tasks/rearrange/rearrange_sensors.py",
 )
 _PROMPT_FILES = (
     "habitat-baselines/habitat_baselines/rl/multi_agent/multi_llm_policy.py",

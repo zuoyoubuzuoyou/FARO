@@ -1,5 +1,9 @@
 # 修改原始源码的LLM恢复
 
+检测与恢复统一采用“固定通用指令＋逐次替换的结构化输入”，完整花括号占位符、输入字段对应关系及近期轨迹筛选规则见[通用 Prompt 模板](llm_prompt_templates.md)。指令不按基准或任务类别分别编写，具体任务、代码与接口来自本次数据。
+
+当前默认的 `mode=source, detector=llm` 已升级为同一次 LLM 调用中的检测与源码修复，并启用更严格的自动应用范围，详见[一体化检测与修复说明](combined_source_repair.md)。下面保留此前两阶段源码恢复及开发者显式注入旧生成器的接口说明；其中宽范围 worker／环境修改不属于当前受限自动模式的权限。实际默认权限以请求中的 `code.edit_policy` 为准。
+
 本模式实现“系统异常 → 固定上下文 → LLM修改原执行代码 → 安装修改 → 原地继续 → 根据反馈继续改代码”。`recovery.mode=source`是现在的默认模式；总开关`enabled`仍默认关闭。此前的`recover(context, memory)`扩展保留为显式的`mode=extension`兼容模式。
 
 ## 实际修改什么
@@ -43,7 +47,7 @@ LLM可以给原`MultiLLMPolicy`新增此前不存在的Resume方法，也可以�
 | `planner_plan` | 各agent实际已经生成的规划 |
 | `recent_history` | 各agent最近10个完整对话轮 |
 | `runtime` | 当前和近期真实状态、工具/实体、当前对象的实际类绑定、允许的源码目标 |
-| `code.source_files` | 原模拟、控制、模型调用文件的完整内容、路径、SHA256、模块、类、parent/worker角色 |
+| `code.source_files` | 模型收到完整相关方法及必要依赖的视图、路径、完整原文件SHA256、模块、类、parent/worker角色；完整文件另存本地审计 |
 | `recovery` | 已有源码版本、失败/应用结果、进展反馈及当前生效版本 |
 | `available_api` | 源码补丁格式、生效方式、调用约束 |
 
@@ -94,7 +98,7 @@ EMOS_LLM_MODEL=gpt-6-sol PYTHONDONTWRITEBYTECODE=1 /home/dyc/.conda/envs/habitat
 
 更换benchmark时修改原任务配置和`recovery.task`：`Perception`、`Mobility`、`Rearrange`或`Manipulation`。核心框架不为每个benchmark硬编码恢复方案。当前EMOS多机器人策略及恢复均限制为单环境。
 
-默认每50步采样、10点窗口、每5点检测；`recorder-v2`首查通常是451步。源码修改最多尝试3版（拒绝也计数），决策最多重试3次，普通报警的生成/应用间隔为250步，250步后检查可见进展。执行异常无需等待冷却，但仍受版本预算限制。相关参数为`sample_every`、`window`、`check_every`、`max_iterations`、`max_policy_retries`、`cooldown_steps`、`verify_after_steps`。
+默认每50步采样、10点窗口、每5点检测；`recorder-v2`首查通常是451步。源码修改默认只尝试1轮（拒绝或不可修复也计数），决策最多重试3次，应用250步后检查可见进展；耗尽修复预算后不再生成新版本，原任务继续执行。普通报警的生成/应用间隔仍为250步，显式增加预算时支持多轮修订。执行异常无需等待冷却，但仍受版本预算限制。相关参数为`sample_every`、`window`、`check_every`、`max_iterations`、`max_policy_retries`、`cooldown_steps`、`verify_after_steps`。
 
 `recovery.detector=team_progress`可改用团队进展规则，源码仍由LLM生成。源码方法在原进程执行，旧的`execution_timeout`只限制兼容扩展模式的独立Python进程，不能抢占源码模式中的死循环或长时间原生调用。静态检查与回退不构成任意Python安全沙箱。
 

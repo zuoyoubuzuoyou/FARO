@@ -17,6 +17,9 @@ from habitat.tasks.rearrange.actions.actions import (
 )
 from habitat.tasks.rearrange.utils import place_agent_at_dist_from_pos
 from habitat.tasks.utils import get_angle
+from habitat.tasks.rearrange.actions.navigation_diagnostics import (
+    _record_navigation_diagnostics,
+)
 from habitat_sim.physics import VelocityControl
 
 
@@ -131,6 +134,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
         )
 
     def reset(self, *args, **kwargs):
+        _record_navigation_diagnostics(self, phase="reset")
         super().reset(*args, **kwargs)
         if self._task._episode_id != self._prev_ep_id:
             self._targets = {}
@@ -139,6 +143,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
 
     def _get_target_for_idx(self, nav_to_target_idx: int):
         if nav_to_target_idx not in self._targets:
+            _record_navigation_diagnostics(self, phase="cache_miss")
             nav_to_obj = self._poss_entities[nav_to_target_idx]
             obj_pos = self._task.pddl_problem.sim_info.get_entity_pos(
                 nav_to_obj
@@ -160,6 +165,8 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
                 np.array(start_pos),
                 np.array(obj_pos),
             )
+        else:
+            _record_navigation_diagnostics(self, phase="cache_hit")
         return self._targets[nav_to_target_idx]
 
     def _path_to_point(self, point):
@@ -175,15 +182,18 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
         path.requested_start = agent_pos
         path.requested_end = point
         found_path = self._sim.pathfinder.find_path(path)
+        _record_navigation_diagnostics(self, locals(), phase="path")
         if not found_path:
             return [agent_pos, point]
         return path.points
 
     def step(self, *args, **kwargs):
+        _record_navigation_diagnostics(self)
         self.skill_done = False
         nav_to_target_idx = kwargs[
             self._action_arg_prefix + "oracle_nav_action"
         ]
+        _record_navigation_diagnostics(self, locals(), phase="input")
         if nav_to_target_idx <= 0 or nav_to_target_idx > len(
             self._poss_entities
         ):
@@ -193,6 +203,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
         final_nav_targ, obj_targ_pos = self._get_target_for_idx(
             nav_to_target_idx
         )
+        _record_navigation_diagnostics(self, locals(), phase="target")
         base_T = self.cur_articulated_agent.base_transformation
         curr_path_points = self._path_to_point(final_nav_targ)
         robot_pos = np.array(self.cur_articulated_agent.base_pos)
@@ -224,6 +235,8 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
                 and angle_to_obj < self._config.turn_thresh
             )
 
+            _record_navigation_diagnostics(self, locals(), phase="geometry")
+
             if self.motion_type == "base_velocity":
                 if not at_goal:
                     if dist_to_final_nav_targ < self._config.dist_thresh:
@@ -243,6 +256,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
                     vel = [0, 0]
                     self.skill_done = True
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 BaseVelAction.step(self, *args, **kwargs)
                 return
 
@@ -265,6 +279,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
                     vel = [0, 0]
                     self.skill_done = True
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 BaseVelNonCylinderAction.step(self, *args, **kwargs)
                 return
 
@@ -291,6 +306,7 @@ class OracleNavAction(BaseVelAction, BaseVelNonCylinderAction, HumanoidJointActi
                     base_action
                 )
 
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 HumanoidJointAction.step(self, *args, **kwargs)
                 return
             else:
@@ -308,6 +324,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
     def __init__(self, *args, **kwargs):
         config = kwargs["config"]
         task = kwargs["task"]
+        self._task = task
         self.motion_type = config.motion_control
         self._targets = {}
         if self.motion_type == "base_velocity":
@@ -325,6 +342,10 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
 
         else:
             raise ValueError("Unrecognized motion type for oracle nav  action")
+
+    def reset(self, *args, **kwargs):
+        _record_navigation_diagnostics(self, phase="reset")
+        super().reset(*args, **kwargs)
 
     @staticmethod
     def _compute_turn(rel, turn_vel, robot_forward):
@@ -422,6 +443,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
         pos_key = tuple(pos_key)
 
         if pos_key not in self._targets:
+            _record_navigation_diagnostics(self, phase="cache_miss")
             agent_pos, _, _ = place_agent_at_dist_from_pos(
                 np.array(look_at_pos),
                 0.0,
@@ -433,6 +455,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
             )
             self._targets[pos_key] = agent_pos
         else:
+            _record_navigation_diagnostics(self, phase="cache_hit")
             agent_pos = self._targets[pos_key]
         if self.motion_type == "human_joints":
             self.humanoid_controller.reset(
@@ -453,11 +476,13 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
         path.requested_start = agent_pos
         path.requested_end = point
         found_path = self._sim.pathfinder.find_path(path)
+        _record_navigation_diagnostics(self, locals(), phase="path")
         if not found_path:
             return [agent_pos, point]
         return path.points
 
     def step(self, *args, **kwargs):
+        _record_navigation_diagnostics(self)
         # mode = 0,1,2
         # 0 means both target and lookat are given, 1 means only lookat is given, 2 means only target is given
         self.skill_done = False
@@ -478,6 +503,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
             else:
                 raise ValueError("Mode not provided for oracle nav action") 
         
+        _record_navigation_diagnostics(self, locals(), phase="input")
         if np.linalg.norm(nav_to_target_coord) == 0:
             return {}
 
@@ -485,6 +511,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
             nav_to_target_coord, nav_position_coord, mode
         )
 
+        _record_navigation_diagnostics(self, locals(), phase="target")
         base_T = self.cur_articulated_agent.base_transformation
         curr_path_points = self._path_to_point(final_nav_targ)
         robot_pos = np.array(self.cur_articulated_agent.base_pos)
@@ -522,6 +549,8 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
                 and angle_to_obj < self._config.turn_thresh
             )
 
+            _record_navigation_diagnostics(self, locals(), phase="geometry")
+
             if self.motion_type == "base_velocity":
                 if not at_goal:
                     if dist_to_final_nav_targ < self._config.dist_thresh:
@@ -544,6 +573,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
                 else:
                     vel = [0, 0]
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 return BaseVelAction.step(self, *args, **kwargs)
 
             elif self.motion_type == "base_velocity_non_cylinder":
@@ -568,6 +598,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
                 else:
                     vel = [0, 0]
                 kwargs[f"{self._action_arg_prefix}base_vel"] = np.array(vel)
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 return BaseVelNonCylinderAction.step(self, *args, **kwargs)
 
             elif self.motion_type == "human_joints":
@@ -599,6 +630,7 @@ class OracleNavCoordinateAction(BaseVelAction, BaseVelNonCylinderAction, Humanoi
                     base_action
                 )
 
+                _record_navigation_diagnostics(self, locals(), phase="control")
                 return HumanoidJointAction.step(self, *args, **kwargs)
             else:
                 raise ValueError(

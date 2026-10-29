@@ -17,6 +17,8 @@ import tempfile
 import types
 from uuid import uuid4
 
+from .source_execution_guard import execution_target, validate_execution_method
+
 
 SOURCE_TARGETS = {
     "habitat-baselines/habitat_baselines/rl/multi_agent/multi_llm_policy.py": {
@@ -42,6 +44,12 @@ SOURCE_TARGETS = {
         "classes": ["OraclePickPolicy", "OraclePlacePolicy"], "process": "parent"},
     "habitat-baselines/habitat_baselines/rl/hrl/skills/wait.py": {
         "module": "habitat_baselines.rl.hrl.skills.wait", "classes": ["WaitSkillPolicy"], "process": "parent"},
+    "habitat-lab/habitat/tasks/rearrange/actions/oracle_nav_action.py": {
+        "module": "habitat.tasks.rearrange.actions.oracle_nav_action",
+        "classes": ["OracleNavAction", "OracleNavCoordinateAction"], "process": "worker"},
+    "habitat-lab/habitat/tasks/rearrange/actions/habitat_mas_actions.py": {
+        "module": "habitat.tasks.rearrange.actions.habitat_mas_actions",
+        "classes": ["OracleNavDiffBaseAction"], "process": "worker"},
     "habitat-lab/habitat/core/env.py": {
         "module": "habitat.core.env", "classes": ["Env", "RLEnv"], "process": "worker"},
     "habitat-lab/habitat/core/environments.py": {
@@ -69,6 +77,386 @@ _FORBIDDEN_CALLS = {
     "urlopen", "request", "get", "post", "put", "delete", "reset", "close",
 }
 _NETWORK_PARTS = {"client", "socket", "session", "connection", "completions"}
+
+RESTRICTED_SOURCE_POLICY = {
+    "profile": "emos-execution-source-v2",
+    "automatic_application": "Only declared parser, control-state and execution edit regions are accepted in parent and navigation worker methods.",
+    "editable": {
+        "MultiLLMPolicy": ["Resume* (signature self, context)"],
+        "OpenAIModel": ["_parse_tool_arguments", "_parse_response_message"],
+        "WaitSkillPolicy": ["_is_skill_done (elapsed-step/requested-duration predicate only)"],
+        "SkillPolicy": ["should_terminate (high-level interrupt combination only)"],
+        "OracleNavPolicy": ["_is_skill_done (gate the actual completion sensor with control timing only)"],
+        "OracleNavAction": ["step (completion predicate and at-goal completion flag only)"],
+        "OracleNavCoordinateAction": ["step (completion predicate and at-goal completion flag only)"],
+        "OracleNavDiffBaseAction": ["step (completion predicate, at-goal flag and stale-cache suppression only)"],
+    },
+    "control_writes": ["child._cur_call_high_level[0] = True while iterating self._active_policies", "self.source_resume_count = a nonnegative literal integer",
+                       "Inside Resume, iterate child._skills.values(): skill._cur_skill_step[:] = 0 and skill._was_running_on_prev_step = False; preserve arguments, selected targets and all other state."],
+    "parser_operations": "Return JSON derived from actual call.function.arguments, without overwriting parsed keys; appending up to four closing delimiters/whitespace characters is supported. Conditions, exceptions and one literal range retry loop (at most 32 iterations) are supported. Existing parser logging calls, order and control branches must remain unchanged.",
+    "execution_operations": "Preserve the complete original method AST outside the declared edit regions. Wait completion must still depend on actual elapsed steps and the original requested duration. Navigation completion must retain real distance bounds using original or stricter configuration thresholds; never constant true. Sensor completion may only be gated, never synthesized. Preserve geometry, motion writes/calls, timeouts, postconditions and diagnostics.",
+    "read_only": ["environment/task/simulator source", "navigation action code outside the declared completion regions", "physics and held objects", "observations and task goals",
+                  "success/reward/metrics", "model identity, capabilities and conversation history"],
+    "unsupported": "Arbitrary rewrites outside declared execution regions, changed motion generation or thresholds, new external calls, live-object aliases, computed calls and unbounded loops are rejected. This static profile is not an arbitrary-Python security sandbox or a proof of repair correctness.",
+}
+_RESTRICTED_PROFILE = RESTRICTED_SOURCE_POLICY["profile"]
+_RESTRICTED_BUILTINS = {"len", "min", "max", "abs", "sum", "range", "enumerate", "zip",
+                        "list", "dict", "tuple", "str", "int", "float", "bool", "round",
+                        "sorted", "any", "all", "isinstance"}
+_RESTRICTED_EXCEPTIONS = {"Exception", "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError"}
+_RESTRICTED_DATA_METHODS = {"get", "items", "keys", "values", "count", "index", "copy",
+                            "lower", "upper", "split", "startswith", "endswith", "strip", "replace"}
+_RESTRICTED_MUTATORS = {"append", "extend", "update", "pop", "clear"}
+
+
+def _restricted_target(relative, qualified, registry):
+    """Readable original source is deliberately broader than editable source."""
+    class_name, name = _target(relative, qualified, registry)
+    specification = execution_target(relative, qualified)
+    if specification is not None:
+        if registry[relative]["process"] != specification["process"]:
+            raise ValueError("Execution method process does not match its declared source target")
+        return False
+    if registry[relative]["process"] != "parent":
+        raise ValueError("Restricted source profile keeps worker/environment/simulator source read-only")
+    production = relative in SOURCE_TARGETS
+    allowed = RESTRICTED_SOURCE_POLICY["editable"].get(class_name, [])
+    # Hosts may explicitly supply small test/application classes. They receive
+    # the same expression/write checks, never unrestricted object access.
+    if not production:
+        allowed = list(allowed) + ["Resume", "act", "parse", "parse_arguments", "_parse_arguments"]
+    resume = class_name == "MultiLLMPolicy" and name.startswith("Resume")
+    if (not resume and name not in allowed) or class_name in {"Env", "RLEnv", "RLTaskEnv", "RearrangeSim", "RearrangeTask"}:
+        raise ValueError("Method is read-only in the restricted source profile: " + qualified)
+    return not production
+
+
+class _RestrictedMethod:
+    """Fail-closed syntax/capability profile for trusted host data and classes.
+
+    This is intentionally small: it does not infer the effects of arbitrary
+    Python helpers or expose module globals as callable values. Only parser
+    descriptors and the one declared control flag may reference live objects.
+    """
+
+    def __init__(self, method, original, fixture=False):
+        self.names = {arg.arg: "data" for arg in method.args.args + method.args.posonlyargs + method.args.kwonlyargs
+                      if arg.arg != "self"}
+        self.fixture = fixture
+        self.resume = method.name.startswith("Resume")
+        self.parser = method.name if method.name in {"_parse_tool_arguments", "_parse_response_message"} else None
+        self.inputs = set(self.names) if self.parser else set()
+        for name in {"call", "response"} & self.names.keys():
+            self.names[name] = "descriptor"
+        self.original_calls = Counter(ast.dump(node, include_attributes=False)
+            for node in ast.walk(original) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "record_event") if original else Counter()
+        self.loop_count = 0
+        if self.logging_layout(method, bool(self.parser)) != self.logging_layout(original, bool(self.parser)):
+            self.reject("existing parser logging must retain its calls, order and control branches")
+        self.block(method.body)
+
+    @staticmethod
+    def logging_layout(method, include_returns=False):
+        result = []
+
+        def visit(node, control=()):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "record_event":
+                result.append((ast.dump(node, include_attributes=False), control))
+            if include_returns and isinstance(node, ast.Return):
+                result.append(("return", control))
+            for field, value in ast.iter_fields(node):
+                branch = control
+                if isinstance(node, (ast.If, ast.For, ast.Try, ast.ExceptHandler)):
+                    branch += (type(node).__name__ + "." + field,)
+                    if isinstance(node, ast.ExceptHandler):
+                        branch += (ast.dump(node.type, include_attributes=False) if node.type else "bare", node.name)
+                for child in value if isinstance(value, list) else [value]:
+                    if isinstance(child, ast.AST):
+                        visit(child, branch)
+
+        if method is not None:
+            visit(method)
+        return result
+
+    def reject(self, detail):
+        raise ValueError("Restricted source profile: " + detail)
+
+    def merge(self, branches):
+        self.names = {name: values[0] if all(value == values[0] for value in values) else "data"
+                      for name in set().union(*branches)
+                      for values in [[branch[name] for branch in branches if name in branch]]}
+
+    def branch(self, statements, initial):
+        self.names = dict(initial)
+        self.block(statements)
+        return dict(self.names)
+
+    def block(self, statements):
+        for node in statements:
+            if isinstance(node, (ast.Return, ast.Expr)):
+                kind = "data"
+                if node.value is not None:
+                    kind = self.expr(node.value)
+                if isinstance(node, ast.Return) and self.parser:
+                    required = "parsed" if self.parser == "_parse_tool_arguments" else "message"
+                    if kind != required:
+                        self.reject("parser returns must come from the actual model response/arguments")
+            elif isinstance(node, ast.Assign):
+                kind = self.expr(node.value)
+                # A chained assignment can otherwise share a mutable object
+                # between a declared live slot and a local alias.
+                if len(node.targets) != 1:
+                    self.reject("chained assignments are unsupported")
+                self.store(node.targets[0], kind, node.value)
+            elif isinstance(node, ast.AugAssign):
+                if not (isinstance(node.op, ast.Add) and isinstance(node.value, ast.Constant)
+                        and type(node.value.value) is int and abs(node.value.value) <= 1000000):
+                    self.reject("augmented assignments are limited to small counter increments")
+                self.expr(node.value)
+                self.store(node.target, "data", node.value, augmented=True)
+            elif isinstance(node, ast.If):
+                self.expr(node.test)
+                initial = dict(self.names)
+                self.merge([self.branch(node.body, initial), self.branch(node.orelse, initial)])
+            elif isinstance(node, ast.For):
+                self.loop_count += 1
+                if self.loop_count > (2 if self.resume else 1) or not isinstance(node.target, ast.Name) or node.target.id in self.names:
+                    self.reject("only bounded control iteration with fresh local bindings is supported")
+                initial = dict(self.names)
+                if _parts(node.iter) == ["self", "_active_policies"]:
+                    self.bind(node.target.id, "child")
+                elif (self.resume and isinstance(node.iter, ast.Call)
+                      and isinstance(node.iter.func, ast.Attribute)
+                      and not node.iter.args and not node.iter.keywords
+                      and len(_parts(node.iter.func)) == 3
+                      and _parts(node.iter.func)[1:] == ["_skills", "values"]
+                      and self.names.get(_parts(node.iter.func)[0]) == "child"):
+                    self.bind(node.target.id, "skill")
+                elif (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name)
+                      and node.iter.func.id == "range" and not node.iter.keywords):
+                    if not self.parser:
+                        self.reject("literal retry loops are limited to parser repairs")
+                    self.literal_range(node.iter)
+                    self.bind(node.target.id, "data")
+                else:
+                    self.reject("only literal retry ranges and declared policy/skill iteration are supported")
+                self.block(node.body)
+                after = dict(self.names)
+                after.pop(node.target.id, None)
+                self.merge([initial, after])
+                self.block(node.orelse)
+            elif isinstance(node, ast.Try):
+                initial = dict(self.names)
+                body = self.branch(node.body, initial)
+                self.merge([initial, body])
+                interrupted = dict(self.names)
+                branches = [self.branch(node.orelse, body)]
+                for handler in node.handlers:
+                    if handler.type is not None:
+                        self.exception_type(handler.type)
+                    self.names = dict(interrupted)
+                    if handler.name:
+                        self.bind(handler.name, "data")
+                    self.block(handler.body)
+                    if handler.name:
+                        self.names.pop(handler.name, None)
+                    branches.append(dict(self.names))
+                self.merge(branches)
+                self.block(node.finalbody)
+            elif isinstance(node, ast.Raise):
+                if node.exc is not None:
+                    self.expr(node.exc)
+                if node.cause is not None:
+                    self.expr(node.cause)
+            elif isinstance(node, ast.Assert):
+                self.expr(node.test)
+                if node.msg is not None:
+                    self.expr(node.msg)
+            elif not isinstance(node, (ast.Pass, ast.Break, ast.Continue)):
+                self.reject("unsupported recovery syntax " + type(node).__name__)
+
+    def bind(self, name, kind):
+        if (name == "self" or name in self.inputs or name.startswith("__") or name in _FORBIDDEN_NAMES | _FORBIDDEN_ROOTS
+                or name in _RESTRICTED_BUILTINS | _RESTRICTED_EXCEPTIONS | {"json", "record_event", "type"}
+                or self.names.get(name) in {"child", "skill"}):
+            self.reject("binding would alias or replace a trusted capability")
+        self.names[name] = kind
+
+    def literal_range(self, node):
+        try:
+            values = [ast.literal_eval(value) for value in node.args]
+            if node.keywords or not 1 <= len(values) <= 3 or any(type(value) is not int for value in values):
+                raise ValueError()
+            if len(range(*values)) > 32:
+                raise ValueError()
+        except (ValueError, TypeError, OverflowError):
+            self.reject("retry ranges must have literal bounds and at most 32 iterations")
+
+    def store(self, target, kind, value, augmented=False):
+        if isinstance(target, ast.Name):
+            self.bind(target.id, kind)
+            return
+        parts = _parts(target)
+        if (self.resume and len(parts) == 2 and self.names.get(parts[0]) == "skill"
+                and parts[1] == "_was_running_on_prev_step"
+                and isinstance(value, ast.Constant) and value.value is False and not augmented):
+            return
+        if parts == ["self", "source_resume_count"]:
+            if not (isinstance(value, ast.Constant) and type(value.value) is int and 0 <= value.value <= 1000000 and not augmented):
+                self.reject("source resume counters must be small nonnegative literal integers")
+            return
+        fixture_fields = {"active", "resume_count", "source_resume_count", "steps", "mode"}
+        if (self.fixture and len(parts) == 2 and parts[0] == "self" and parts[1] in fixture_fields):
+            if parts[1] == "active" and not (isinstance(value, ast.Constant) and type(value.value) is bool and not augmented):
+                self.reject("activation flags must be literal booleans")
+            return
+        if isinstance(target, ast.Subscript):
+            flag = _parts(target.value)
+            if (self.resume and len(flag) == 2 and self.names.get(flag[0]) == "skill"
+                    and flag[1] == "_cur_skill_step" and isinstance(target.slice, ast.Slice)
+                    and all(item is None for item in (target.slice.lower, target.slice.upper, target.slice.step))
+                    and isinstance(value, ast.Constant) and type(value.value) is int
+                    and value.value == 0 and not augmented):
+                return
+            if (len(flag) == 2 and flag[1] == "_cur_call_high_level"
+                    and (flag[0] == "self" or self.names.get(flag[0]) == "child")
+                    and isinstance(target.slice, ast.Constant) and type(target.slice.value) is int and target.slice.value == 0
+                    and isinstance(value, ast.Constant) and value.value is True and not augmented):
+                return
+            if self.expr(target.value) == "owned":
+                self.expr(target.slice)
+                return
+        self.reject("writes are limited to local data and declared resume control flags")
+
+    def exception_type(self, node):
+        if isinstance(node, ast.Name) and node.id in _RESTRICTED_EXCEPTIONS:
+            return
+        if _parts(node) == ["json", "JSONDecodeError"]:
+            return
+        if isinstance(node, ast.Tuple):
+            for item in node.elts:
+                self.exception_type(item)
+            return
+        self.reject("unknown exception type")
+
+    def expr(self, node):
+        if isinstance(node, ast.Constant):
+            return "data"
+        if isinstance(node, ast.Name):
+            kind = self.names.get(node.id)
+            if kind not in {"data", "owned", "arguments", "parsed", "message"}:
+                self.reject("unknown, live-object or callable reference " + node.id)
+            return kind
+        if isinstance(node, ast.Attribute):
+            parts = _parts(node)
+            if (self.parser == "_parse_tool_arguments" and self.names.get("call") == "descriptor"
+                    and parts in [["call", "function", "arguments"], ["call", "function", "name"], ["call", "id"]]):
+                return "arguments" if parts[-1] == "arguments" else "data"
+            if (len(parts) == 2 and parts[0] == "self" and parts[1] in
+                    ({"agent_name", "_trace_call_id", "source_resume_count"} | ({"active", "resume_count", "steps", "mode", "history"} if self.fixture else set()))):
+                return "data"
+            if (node.attr == "__name__" and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name) and node.value.func.id == "type"
+                    and len(node.value.args) == 1 and not node.value.keywords
+                    and isinstance(node.value.args[0], ast.Name) and self.names.get(node.value.args[0].id) == "data"):
+                self.expr(node.value.args[0])
+                return "data"
+            if (self.parser == "_parse_response_message" and self.names.get("response") == "descriptor"
+                    and node.attr == "message" and isinstance(node.value, ast.Subscript)
+                    and _parts(node.value.value) == ["response", "choices"]
+                    and isinstance(node.value.slice, ast.Constant) and node.value.slice.value == 0):
+                return "message"
+            self.reject("attribute access is outside declared parser/control data")
+        if isinstance(node, ast.Subscript):
+            self.expr(node.value)
+            self.expr(node.slice)
+            # Shallow copies/containers can still contain borrowed objects.
+            return "data"
+        if isinstance(node, ast.Slice):
+            for value in (node.lower, node.upper, node.step):
+                if value is not None:
+                    self.expr(value)
+            return "data"
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for item in node.elts:
+                if self.expr(item) == "owned" and not isinstance(item, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                    self.reject("shared local containers are outside the bounded data profile")
+            return "owned"
+        if isinstance(node, ast.Dict):
+            if any(key is None for key in node.keys):
+                self.reject("dictionary unpacking is unsupported")
+            for item in node.keys + node.values:
+                if self.expr(item) == "owned" and not isinstance(item, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                    self.reject("shared local containers are outside the bounded data profile")
+            return "owned"
+        if isinstance(node, ast.Call):
+            return self.call(node)
+        if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp)):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Pow, ast.LShift, ast.RShift, ast.Mult, ast.MatMult, ast.Mod)):
+                self.reject("unbounded integer expansion is unsupported")
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left, right = self.expr(node.left), self.expr(node.right)
+                literal = node.right
+                if (left == "arguments" and isinstance(literal, ast.Constant)
+                        and isinstance(literal.value, str) and len(literal.value) <= 4
+                        and set(literal.value) <= set('}] \n\t')):
+                    return "arguments"
+                self.reject("dynamic concatenation is limited to closing argument delimiters")
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    self.expr(child)
+            return "data"
+        self.reject("unsupported expression " + type(node).__name__)
+
+    def call(self, node):
+        if not isinstance(node.func, (ast.Name, ast.Attribute)) or any(keyword.arg is None for keyword in node.keywords):
+            self.reject("computed calls and argument unpacking are unsupported")
+        parts = _parts(node.func)
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+            if name in self.names:
+                self.reject("local/input bindings cannot be used as trusted callable names")
+            if name == "record_event":
+                key = ast.dump(node, include_attributes=False)
+                if self.original_calls[key] <= 0:
+                    self.reject("new or changed observation/logging producers are unsupported")
+                self.original_calls[key] -= 1
+            elif name not in _RESTRICTED_BUILTINS | _RESTRICTED_EXCEPTIONS:
+                self.reject("only declared data calls are supported")
+            if name == "range":
+                self.literal_range(node)
+            if name == "isinstance":
+                if len(node.args) != 2 or not isinstance(node.args[1], ast.Name) or node.args[1].id not in {"dict", "list", "str", "int", "float", "bool", "tuple"}:
+                    self.reject("isinstance requires a declared data type")
+                self.expr(node.args[0])
+                return "data"
+        elif parts == ["json", "loads"]:
+            if any(keyword.arg not in {"ensure_ascii", "allow_nan", "sort_keys"} for keyword in node.keywords):
+                self.reject("JSON callbacks/options outside the data profile are unsupported")
+            if self.parser == "_parse_tool_arguments" and parts[-1] == "loads":
+                if len(node.args) != 1 or self.expr(node.args[0]) != "arguments":
+                    self.reject("argument parsing must use the actual model arguments")
+        elif (self.fixture and parts == ["self", "history", "append"]
+              and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+              and not node.keywords):
+            return "data"
+        elif node.func.attr in _RESTRICTED_DATA_METHODS | _RESTRICTED_MUTATORS:
+            kind = self.expr(node.func.value)
+            if node.func.attr in _RESTRICTED_MUTATORS:
+                self.reject("container mutators are outside the bounded parser/control profile")
+        else:
+            self.reject("new live-object, filesystem, network or control calls are unsupported")
+        for argument in node.args + [keyword.value for keyword in node.keywords]:
+            self.expr(argument)
+        if self.parser == "_parse_tool_arguments" and parts == ["json", "loads"]:
+            return "parsed"
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "strip"
+                and not node.args and not node.keywords and self.expr(node.func.value) == "arguments"):
+            return "arguments"
+        if parts == ["json", "loads"] or parts in [["dict"], ["list"], ["tuple"]] or (isinstance(node.func, ast.Attribute) and node.func.attr == "copy"):
+            return "owned"
+        return "data"
 
 
 def _hash(content):
@@ -185,7 +573,8 @@ def _parts(node):
     if isinstance(node, ast.Name):
         return [node.id]
     if isinstance(node, ast.Attribute):
-        return _parts(node.value) + [node.attr]
+        parts = _parts(node.value)
+        return parts + [node.attr] if parts else []
     return []
 
 
@@ -292,19 +681,23 @@ def _atomic_write(path, content, mode):
 
 
 class SourceTransaction:
-    def __init__(self, root, files, entrypoint, patches):
+    def __init__(self, root, files, entrypoint, patches, restricted=False):
         self.id = str(uuid4())
         self.root = root
         self.files = deepcopy(files)
         self.entrypoint = deepcopy(entrypoint)
         self.patches = deepcopy(patches)
+        self.restricted = bool(restricted)
         self._committed = False
 
     def manifest(self, process=None):
         if process not in {None, "parent", "worker"}:
             raise ValueError("Unknown source process")
-        return {"transaction_id": self.id, "files": deepcopy([
+        result = {"transaction_id": self.id, "files": deepcopy([
             item for item in self.files if process is None or item["process"] == process])}
+        if self.restricted:
+            result["validation_profile"] = _RESTRICTED_PROFILE
+        return result
 
     def _write(self, reverse=False):
         expected, replacement = (("after", "before") if reverse else ("before", "after"))
@@ -368,10 +761,11 @@ class SourceTransaction:
 
 
 class SourcePatchManager:
-    def __init__(self, root, artifact_dir, targets=None):
+    def __init__(self, root, artifact_dir, targets=None, restricted=False):
         self.root = _root(root)
         self.artifact_dir = Path(artifact_dir)
         self.targets = _registry(targets)
+        self.restricted = bool(restricted)
         self._current = None
 
     def snapshot(self):
@@ -393,6 +787,7 @@ class SourcePatchManager:
             relative = patch["path"]
             _path(self.root, relative)
             class_name, method_name = _target(relative, patch["target"], self.targets)
+            fixture = _restricted_target(relative, patch["target"], self.targets) if self.restricted else False
             identity = (relative, patch["target"])
             if identity in seen:
                 raise ValueError("Duplicate source target")
@@ -411,7 +806,9 @@ class SourcePatchManager:
                     and any(isinstance(item, ast.Name) and item.id == method_name for item in ast.walk(node))
                     for node in owner.body):
                 raise ValueError("New method would replace an existing nonmethod class attribute")
-            _method(patch["code"], method_name, original)
+            method = _method(patch["code"], method_name, original)
+            if self.restricted and not validate_execution_method(relative, patch["target"], method, original):
+                _RestrictedMethod(method, original, fixture=fixture)
             if original is None:
                 start = end = owner.end_lineno
                 insertion = "\n" + "\n".join(" " * (owner.col_offset + 4) + line
@@ -438,7 +835,7 @@ class SourcePatchManager:
             file.pop("tree")
             files.append(file)
         _entrypoint(proposal.get("entrypoint"), files, self.targets)
-        transaction = SourceTransaction(self.root, files, proposal["entrypoint"], patches)
+        transaction = SourceTransaction(self.root, files, proposal["entrypoint"], patches, restricted=self.restricted)
         transaction.save(self.artifact_dir)
         self._current = transaction
         return transaction
@@ -502,14 +899,22 @@ def _compiled_method(method, owner, module, previous, filename):
 
 class RuntimeSourcePatcher:
     """Install methods only in modules already loaded by this process."""
-    def __init__(self, root, targets=None):
+    def __init__(self, root, targets=None, restricted=False):
         self.root = _root(root)
         self.targets = _registry(targets)
+        self.restricted = bool(restricted)
         self._stack = []
 
     def install(self, manifest):
-        if not isinstance(manifest, dict) or set(manifest) != {"transaction_id", "files"}:
+        if (not isinstance(manifest, dict)
+                or set(manifest) not in ({"transaction_id", "files"}, {"transaction_id", "files", "validation_profile"})):
             raise ValueError("Invalid source transaction manifest")
+        profile = manifest.get("validation_profile")
+        if "validation_profile" in manifest and profile != _RESTRICTED_PROFILE:
+            raise ValueError("Unknown or downgraded source validation profile")
+        restricted = self.restricted or profile == _RESTRICTED_PROFILE
+        if restricted and profile != _RESTRICTED_PROFILE:
+            raise ValueError("Restricted source validation profile is required by this host")
         identity = manifest["transaction_id"]
         if not isinstance(identity, str) or not identity or any(item["id"] == identity for item in self._stack):
             raise ValueError("Source transaction ID is missing or already installed")
@@ -521,10 +926,15 @@ class RuntimeSourcePatcher:
             path = _path(self.root, relative)
             if relative not in self.targets or file["module"] != self.targets[relative]["module"]:
                 raise ValueError("Manifest module is not allowlisted")
+            if restricted and file.get("process") != self.targets[relative]["process"]:
+                raise ValueError("Restricted source manifest process does not match its declared source target")
             for kind in ("before", "after"):
                 if _hash(file[kind + "_source"].encode("utf-8")) != file[kind + "_sha256"]:
                     raise ValueError("Manifest source hash is invalid")
-            if _hash(path.read_bytes()) not in {file["before_sha256"], file["after_sha256"]}:
+            current_hash = _hash(path.read_bytes())
+            if restricted and current_hash != file["before_sha256"]:
+                raise ValueError("Restricted source install requires the current original source before file commit")
+            if current_hash not in {file["before_sha256"], file["after_sha256"]}:
                 raise ValueError("Runtime source hash conflict: " + relative)
             before = _parse(file["before_source"], relative)
             after = _parse(file["after_source"], relative)
@@ -536,12 +946,15 @@ class RuntimeSourcePatcher:
                 raise ValueError("Loaded module does not match its source target: " + relative)
             for change in file["changes"]:
                 class_name, method_name = _target(relative, change["target"], self.targets)
+                fixture = _restricted_target(relative, change["target"], self.targets) if restricted else False
                 key = (relative, change["target"])
                 if key in seen:
                     raise ValueError("Duplicate runtime source target")
                 seen.add(key)
                 original_ast = _own_method(_class(before, class_name), method_name)
                 method = _method(change["code"], method_name, original_ast)
+                if restricted and not validate_execution_method(relative, change["target"], method, original_ast):
+                    _RestrictedMethod(method, original_ast, fixture=fixture)
                 installed_ast = _own_method(_class(after, class_name), method_name)
                 if installed_ast is None or ast.dump(installed_ast, include_attributes=False) != ast.dump(method, include_attributes=False):
                     raise ValueError("Manifest method does not match complete edited source")
@@ -579,6 +992,7 @@ class RuntimeSourcePatcher:
                     setattr(owner, name, previous)
             raise
         self._stack.append({"id": identity, "changes": applied})
+        self.restricted = restricted
         return {"status": "installed", "transaction_id": identity,
             "pending_modules": sorted(set(pending)), "installed_methods": len(applied)}
 

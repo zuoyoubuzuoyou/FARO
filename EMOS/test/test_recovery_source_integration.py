@@ -34,9 +34,28 @@ RESUME = '''def ResumeFromSourceRevision(self, context):
 '''
 PARSER = '''def _parse_tool_arguments(self, call, phase):
     try:
-        return json.loads(call.function.arguments)
-    except json.JSONDecodeError:
-        return json.loads(call.function.arguments + "}")
+        try:
+            parameters = json.loads(call.function.arguments)
+        except json.JSONDecodeError:
+            parameters = json.loads(call.function.arguments + "}")
+    except Exception as error:
+        record_event(
+            "llm_parse", agent_name=self.agent_name, phase=phase,
+            call_id=self._trace_call_id, status="error",
+            parse_stage="tool_arguments", action_name=call.function.name,
+            tool_call_id=call.id, raw_arguments=call.function.arguments,
+            error_type=type(error).__name__, error_message=str(error),
+            handling="rethrow",
+        )
+        raise
+    record_event(
+        "llm_parse", agent_name=self.agent_name, phase=phase,
+        call_id=self._trace_call_id, status="success",
+        parse_stage="tool_arguments", action_name=call.function.name,
+        tool_call_id=call.id, raw_arguments=call.function.arguments,
+        parameters=parameters, handling="continue",
+    )
+    return parameters
 '''
 
 
@@ -60,13 +79,12 @@ class SourceTransport:
         self.requests.append(deepcopy(request))
         context = json.loads(request["messages"][1]["content"])
         files = context["code"]["source_files"]
-        proposal = {"patches": [
+        proposal = {"system_error": True, "patches": [
             {"path": POLICY_PATH, "target": "MultiLLMPolicy.ResumeFromSourceRevision",
              "base_sha256": files[POLICY_PATH]["sha256"], "code": RESUME},
             {"path": MODEL_PATH, "target": "OpenAIModel._parse_tool_arguments",
              "base_sha256": files[MODEL_PATH]["sha256"], "code": PARSER}],
-            "entrypoint": {"path": POLICY_PATH, "target": "MultiLLMPolicy.ResumeFromSourceRevision"},
-            "explanation": "Add original-class Resume and repair the original model parser"}
+            "entrypoint": {"path": POLICY_PATH, "target": "MultiLLMPolicy.ResumeFromSourceRevision"}}
         return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(proposal)}}]}
 
 

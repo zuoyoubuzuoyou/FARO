@@ -16,12 +16,22 @@ from typing import Iterable, Iterator, Optional
 from habitat_mas.utils.trajectory_storage import iter_trace_events
 
 
-_NAV_FIELDS = frozenset(("available", "timing", "active", "target", "reason",
+_NAV_FIELDS = frozenset(("env_step", "source", "action", "available", "timing", "active", "target", "reason",
     "path_found", "distance_to_goal", "distance_threshold", "angle_to_object",
     "angle_to_waypoint", "angle_threshold", "distance_satisfied", "orientation_satisfied",
     "at_goal", "control", "motion_type", "skill_done", "prev_nav_done", "target_cache_hit",
     "true_object_position", "estimated_object_position", "final_navigation_position",
-    "robot_position_before_control", "next_waypoint"))
+    "robot_position_before_control", "next_waypoint", "requested_target", "proxy_point"))
+_DETECTION_FIELDS = frozenset(("env_step", "timing", "source", "reason", "available",
+    "eligible", "sensor", "pixel_threshold", "detected_object_ids", "target_detections",
+    "target_pixel_counts", "targets", "all_targets_detected", "semantic_id",
+    "detected", "detected_by", "sensor_metadata", "target_semantic_ids", "target_reasons",
+    "semantic_sensors", "target_pixel_counts_by_sensor"))
+_FORBIDDEN = frozenset(("done", "native_success", "task_success", "final_success",
+    "final_result", "outcome", "annotation", "annotations", "label", "labels",
+    "ground_truth", "fault", "fault_events", "dropout_state", "hang_state", "run_label",
+    "mode", "failure_cause", "system_failure_attribution", "runtime_system_error",
+    "pddl_stage_goals", "error_detection"))
 _TERM_FIELDS = frozenset(("skill_steps", "max_skill_steps", "oracle_finished", "timeout_reached",
     "force_end_on_timeout", "high_level_requested_termination", "skill_terminated",
     "episode_terminated", "reason", "status", "is_skill_done", "cur_skill_step",
@@ -31,6 +41,113 @@ _REQUEST = re.compile(r'"(agent_\d+)" agent sent you requests: "(.*?)"\.', re.DO
 
 def _mapping(value):
     return value if isinstance(value, dict) else {}
+
+
+def _observational(value):
+    """Remove labels and hidden runtime interventions from nested observations."""
+    if isinstance(value, dict):
+        return {k: _observational(v) for k, v in value.items()
+                if str(k).lower() not in _FORBIDDEN
+                and not str(k).startswith(("error_detection.", "pddl_stage_goals."))}
+    if isinstance(value, (list, tuple)):
+        return [_observational(v) for v in value]
+    return value
+
+
+def _fresh(value, step, timing, require_source=False):
+    return (isinstance(value, dict) and type(value.get("env_step")) is int
+            and value["env_step"] == step and value.get("timing") == timing
+            and (not require_source or isinstance(value.get("source"), str)
+                 and bool(value["source"].strip())))
+
+
+def _current_goal(value, step):
+    if not isinstance(value, dict):
+        return None
+    clean = {k: _observational(v) for k, v in value.items()
+             if k in ("env_step", "timing", "source", "reason", "reasons")}
+    fresh = _fresh(value, step, "post_env_step", require_source=True)
+    for predicate in ("any_at", "is_detected"):
+        clean[predicate] = {name: flag if fresh and isinstance(flag, bool) else None
+                            for name, flag in _mapping(value.get(predicate)).items()}
+    return clean
+
+
+def _diagnostic(value, step, timing, fields=None):
+    if not isinstance(value, dict):
+        return None
+    clean = _observational({k: v for k, v in value.items() if fields is None or k in fields})
+    # Old recordings have no stamp and retain their original interpretation.
+    if "env_step" in value and not _fresh(value, step, timing):
+        provenance = {"env_step", "timing", "source", "action", "reference", "distance_threshold",
+                      "angle_threshold", "pixel_threshold", "eligible", "sensor",
+                      "sensor_metadata", "target_semantic_ids", "semantic_sensors"}
+        clean = {key: item if key in provenance else None for key, item in clean.items()}
+        clean.update(available=False, reason="stale_or_invalid_observation")
+        if "active" in clean:
+            clean["active"] = False
+        for key in ("target_detections", "target_pixel_counts"):
+            if isinstance(value.get(key), dict):
+                clean[key] = {name: None for name in value[key]}
+        if isinstance(value.get("targets"), dict):
+            clean["targets"] = {name: {"distance": None, "at_goal": None}
+                                for name in value["targets"]}
+    return clean
+
+
+def _outcome_state(value, step):
+    """Compact actual end observation; omit controller internals and task stages."""
+    if not isinstance(value, dict) or type(step) is not int:
+        return None
+    result = {"agents": {}}
+    for name, raw in _mapping(value.get("agents")).items():
+        raw = _mapping(raw)
+        agent = {k: _observational(v) for k, v in raw.items() if k in (
+            "position", "rotation", "base_position", "base_rotation", "root_position",
+            "root_rotation", "base_reference_position", "ee_position", "robot_type",
+            "held_object", "grasped_object_id", "nav_finished", "stop", "camera",
+            "root_position_reason", "camera_sensors")}
+        for key, fields, timing in (("navigation", _NAV_FIELDS, "pre_control"),
+                                     ("detection", _DETECTION_FIELDS, "post_env_step"),
+                                     ("goal_coverage", None, "post_env_step")):
+            if key in raw:
+                agent[key] = (_navigation(raw, step) if key == "navigation" else
+                              _diagnostic(raw[key], step, timing, fields))
+        result["agents"][name] = agent
+    if isinstance(value.get("current_goal"), dict):
+        result["current_goal"] = _current_goal(value["current_goal"], step)
+    objects = value.get("objects", value.get("target_objects"))
+    fields = {"goal_name", "position", "object_id", "goal_position", "handle", "scene_index"}
+    if isinstance(objects, dict):
+        result["objects"] = {name: {k: _observational(v) for k, v in _mapping(raw).items() if k in fields}
+                             for name, raw in objects.items()}
+    elif isinstance(objects, list):
+        result["target_objects"] = [{k: _observational(v) for k, v in _mapping(raw).items() if k in fields}
+                                    for raw in objects]
+    return result
+
+
+def _runtime_feedback(record):
+    kind = record.get("event_type", record.get("kind"))
+    if kind == "action_outcome":
+        fields = {"action_id", "action_name", "status", "reason", "controller_result",
+                  "termination_signal_step", "observation_env_step", "actual_execution_observed",
+                  "is_placeholder", "availability", "available", "missing_reason", "started_step"}
+        clean = {k: _observational(v) for k, v in record.items() if k in fields}
+        clean["state"] = _outcome_state(record.get("state"), record.get("observation_env_step"))
+        clean["metrics"] = _metric_subset(record.get("metrics"))
+    elif kind == "execution_feedback":
+        fields = {"phase", "call_id", "preceding_action_id", "outcome_env_step", "observation_env_step",
+                  "actual_execution_observed", "feedback_source", "preceding_outcome"}
+        clean = {k: _observational(v) for k, v in record.items() if k in fields}
+        raw = _mapping(record.get("model_feedback"))
+        clean["model_feedback"] = {"user_message": _observational(raw.get("user_message")),
+            "tool_messages": [{k: _observational(v) for k, v in _mapping(message).items()
+                               if k in ("tool_call_id", "name", "content", "is_placeholder")}
+                              for message in raw.get("tool_messages") or []]}
+    else:
+        return None
+    return {"kind": kind, **clean}
 
 
 def _metric_subset(metrics):
@@ -75,7 +192,7 @@ def _tool(messages, fallback):
     return fallback.get("action"), fallback.get("arguments")
 
 
-def _navigation(state):
+def _navigation(state, step):
     raw = state.get("navigation")
     if not isinstance(raw, dict):
         return None
@@ -88,7 +205,7 @@ def _navigation(state):
             selected = next((v for v in candidates if v.get("available") is True), None)
     if selected is None:
         return None
-    return {k: v for k, v in selected.items() if k in _NAV_FIELDS}
+    return _diagnostic(selected, step, "pre_control", _NAV_FIELDS)
 
 
 def _termination(value):
@@ -116,6 +233,7 @@ class FrameStream:
         self.pending_decisions = []
         self.pending_decision_priorities = {}
         self.pending_messages = []
+        self.pending_runtime_feedback = []
 
     def update_context(self, raw):
         raw = _mapping(raw)
@@ -212,10 +330,18 @@ class FrameStream:
                 "rotation": raw.get("rotation", raw.get("base_rotation")),
                 "held_object": raw.get("held_object", raw.get("grasped_object_id")),
                 "action": self.action(agent, command, step),
-                "navigation": _navigation(raw), "termination": _termination(term),
-                "detection": raw.get("detection"), "stop": raw.get("stop"),
+                "navigation": _navigation(raw, step), "termination": _termination(term),
+                "detection": _diagnostic(raw.get("detection"), step, "post_env_step", _DETECTION_FIELDS),
+                "stop": raw.get("stop"),
                 "nav_finished": raw.get("nav_finished"),
             }
+            for key in ("robot_type", "ee_position", "root_position", "root_rotation",
+                        "base_position", "base_rotation", "base_reference_position", "camera",
+                        "root_position_reason", "camera_sensors"):
+                if key in raw:
+                    agents[agent][key] = _observational(raw[key])
+            if "goal_coverage" in raw:
+                agents[agent]["goal_coverage"] = _diagnostic(raw["goal_coverage"], step, "post_env_step")
         objects = {}
         object_records = state.get("objects", state.get("target_objects")) or []
         if isinstance(object_records, dict):
@@ -228,15 +354,36 @@ class FrameStream:
             if raw.get("goal_position") is not None and name not in self.context["goal_positions"]:
                 self.context["goal_positions"][name] = raw["goal_position"]
         metrics = _metric_subset(record.get("metrics", state.get("task_progress")))
+        current_goal = _current_goal(state.get("current_goal"), step)
+        if current_goal is not None:
+            for predicate in ("any_at", "is_detected"):
+                metrics.update({f"current_goal.{predicate}.{name}": value
+                                for name, value in current_goal[predicate].items()})
         if schema == 1:
             decisions, messages = self.old_decisions(record, step)
         else:
             decisions, messages = self.pending_decisions, self.pending_messages
             self.pending_decisions, self.pending_messages = [], []
             self.pending_decision_priorities = {}
-        return deepcopy({"step": step, "task": self.task, "context": self.context,
+        retained = []
+        for event in self.pending_runtime_feedback:
+            stamps = [event.get("env_step")]
+            stamps.extend(event.get(k) for k in ("observation_env_step", "termination_signal_step", "outcome_env_step")
+                          if event.get(k) is not None)
+            if all(type(stamp) is int and 0 <= stamp <= step for stamp in stamps):
+                feedback = _runtime_feedback(event)
+                decisions.append({"agent": event.get("agent_id", event.get("agent_name")),
+                    "tool": event.get("action_name"), "arguments": None, "step": event["env_step"],
+                    "feedback": [feedback], "subtask": None})
+            else:
+                retained.append(event)
+        self.pending_runtime_feedback = retained
+        frame = {"step": step, "task": self.task, "context": self.context,
                          "agents": agents, "objects": objects, "metrics": metrics,
-                         "decisions": decisions, "messages": messages})
+                         "decisions": decisions, "messages": messages}
+        if current_goal is not None:
+            frame["current_goal"] = current_goal
+        return deepcopy(frame)
 
     def pending_decision(self, agent, tool, arguments, priority):
         """Merge one environment step's model/controller events losslessly.
@@ -307,6 +454,9 @@ class FrameStream:
             previous = self.pending_decision(agent, record.get("action_name"), None, 0)
             previous["feedback"].append({"role": "tool", "content": record.get("content"),
                                         "tool_call_id": record.get("tool_call_id"), "placeholder": True})
+        elif kind in ("action_outcome", "execution_feedback") and agent is not None:
+            if kind != "execution_feedback" or record.get("phase", "execution") == "execution":
+                self.pending_runtime_feedback.append(deepcopy(record))
         elif kind in ("communication_send", "communication_receive") and record.get("status") != "suppressed":
             self.pending_messages.append({"kind": "send" if kind.endswith("send") else "receive",
                 "sender": record.get("sender"), "recipient": record.get("recipient"),

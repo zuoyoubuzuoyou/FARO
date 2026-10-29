@@ -137,6 +137,30 @@ class RunConfigTests(unittest.TestCase):
             self.assertEqual(first["version"]["config_snapshot_sha256"],
                              changed["version"]["config_snapshot_sha256"])
 
+    def test_runtime_observation_producers_are_versioned_with_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = (
+                "habitat-lab/habitat/core/trajectory_diagnostics.py",
+                "habitat-lab/habitat/tasks/rearrange/actions/navigation_diagnostics.py",
+                "habitat-lab/habitat/tasks/rearrange/actions/oracle_nav_action.py",
+                "habitat-lab/habitat/tasks/rearrange/actions/habitat_mas_actions.py",
+                "habitat-lab/habitat/tasks/rearrange/multi_task/pddl_sim_state.py",
+                "habitat-lab/habitat/tasks/rearrange/rearrange_sensors.py",
+            )
+            for relative in paths:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("native_evidence = 1\n", encoding="utf-8")
+            first = build_run_metadata(self.config(), repository_root=root)
+            for relative in paths:
+                self.assertIn(relative, first["version"]["source_files"])
+            changed_path = root / paths[0]
+            changed_path.write_text("native_evidence = 2\n", encoding="utf-8")
+            second = build_run_metadata(self.config(), repository_root=root)
+            self.assertNotEqual(first["version"]["source_files"][paths[0]],
+                                second["version"]["source_files"][paths[0]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,14 +18,15 @@ class RecoveryConfig:
     min_stall_steps: int = 100
     reset_budget: int = 100
     history_turns: int = 10
-    max_iterations: int = 3
+    max_iterations: int = 1
     cooldown_steps: int = 250
     verify_after_steps: int = 250
     model_timeout: float = 60.0
     execution_timeout: float = 1.0
     modification_instruction: str = (
-        "修复当前运行异常，为原执行循环增加可持续运行的恢复分支。优先在同一仿真中Resume，"
-        "保留已完成工作、持物、规划和对话；结合上一版本及实际反馈迭代恢复代码。"
+        "先根据任务、当前观测和原始执行代码判断是否存在系统级运行异常；仅在存在异常时，"
+        "在允许范围内提出必要的最小源码修复。不改变任务目标、评分、能力或真实观测，"
+        "保留已完成工作、物理状态、模型与对话，在同一运行实例中Resume；观察恢复后的实际反馈。"
     )
 
     @classmethod

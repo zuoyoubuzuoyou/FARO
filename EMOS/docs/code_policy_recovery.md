@@ -20,6 +20,8 @@ LLM生成完整的 `recover(context, memory)` 函数，用Python条件、计数�
 
 ## 固定Prompt位置
 
+兼容扩展模式同样采用无基准名、无具体任务类型的通用指令。结构化占位符与筛选后的轨迹输入见[通用 Prompt 模板](llm_prompt_templates.md)；本模式仍输出完整 `recover(context, memory)`，接口协议保持一致。
+
 系统提示词在 `habitat-mas/habitat_mas/recovery/generator.py`；用户输入由 `context.py`统一构造。
 
 | 固定字段 | 内容 |

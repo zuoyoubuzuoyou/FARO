@@ -96,10 +96,11 @@ def _references(rows):
 
 
 def _prediction_complete(row):
-    """A valid uncertain query is a negative if the runner completed coverage.
+    """Score an aggregate boolean only when its query coverage is complete.
 
-    The runner aggregates queries into a single detected boolean.  Uncertainty
-    is not missing coverage, whereas an API/parse/budget error is missing data.
+    API, parse and budget errors are missing data rather than negative results.
+    Previously saved aggregate rows remain supported independently of the
+    current model response schema.
     """
     invalid_status = {
         "error", "failed", "partial", "pending", "not_run", "api_error",

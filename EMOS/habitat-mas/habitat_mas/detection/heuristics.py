@@ -5,6 +5,28 @@ import math
 import re
 import json
 
+from .readers import _current_goal, _fresh
+
+
+def _native(frame, predicate, name):
+    native = _current_goal(frame.get('current_goal'), frame['step'])
+    values = (native or {}).get(predicate, {})
+    return (name in values, values.get(name))
+
+
+def _coverage_distance(frame, name):
+    distances = []
+    threshold = None
+    for agent in frame['agents'].values():
+        coverage = agent.get('goal_coverage') or {}
+        if not _fresh(coverage, frame['step'], 'post_env_step') or coverage.get('reference') != 'base_transformation':
+            continue
+        value = (coverage.get('targets') or {}).get(name, {}).get('distance')
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            distances.append(value)
+            threshold = coverage.get('distance_threshold')
+    return (min(distances) if distances else None), threshold
+
 
 def _vector(value):
     if not isinstance(value, (list, tuple)) or len(value) != 3:
@@ -44,6 +66,13 @@ def assess_goals(frame):
         names = ['any_targets|0', 'TARGET_any_targets|0'] if task == 'mobility' else ['any_targets|0', 'any_targets|1']
         threshold = 2.0 if task == 'mobility' else 1.0
         for name in names:
+            recorded, native = _native(frame, 'any_at', name)
+            if recorded:
+                distance, native_threshold = _coverage_distance(frame, name)
+                result.append({'kind': 'coverage', 'object': name, 'satisfied': native,
+                               'distance': distance, 'threshold': native_threshold or threshold,
+                               'approximate': False})
+                continue
             position = _target_position(frame, name) if name.startswith('TARGET_') else objects.get(name, {}).get('position')
             distances = [_distance(a.get('position'), position) for a in frame['agents'].values()]
             available = [v for v in distances if v is not None]
@@ -54,12 +83,20 @@ def assess_goals(frame):
                            'distance': distance, 'threshold': threshold, 'approximate': True})
         if task == 'perception':
             for name in ['any_targets|0', 'any_targets|1']:
+                recorded, native = _native(frame, 'is_detected', name)
+                if recorded:
+                    result.append({'kind': 'detection', 'object': name, 'satisfied': native,
+                                   'threshold': 'native_semantic_pixels', 'approximate': False})
+                    continue
                 flags = []; unknown = False
                 for a in frame['agents'].values():
                     detection = a.get('detection') or {}
                     if detection.get('eligible') is False:
                         continue
                     value = (detection.get('target_detections') or {}).get(name)
+                    if 'env_step' in detection and not _fresh(detection, frame['step'], 'post_env_step'):
+                        unknown = True
+                        continue
                     if detection.get('available') is not False and isinstance(value, bool): flags.append(value)
                     else: unknown = True
                 result.append({'kind': 'detection', 'object': name,
@@ -68,7 +105,10 @@ def assess_goals(frame):
     else:
         raise ValueError('Unsupported detection task: ' + task)
     if metrics.get('pddl_success') == 1:
-        for r in result: r['satisfied'] = True
+        for r in result:
+            predicate = {'coverage': 'any_at', 'detection': 'is_detected'}.get(r['kind'])
+            if predicate is None or not _native(frame, predicate, r['object'])[0]:
+                r['satisfied'] = True
     return result
 
 
@@ -133,6 +173,11 @@ def _progress(frames, agent=None):
     if len(frames) < 2: return False
     first = frames[0]
     for current in list(frames)[1:]:
+        for predicate in ('any_at', 'is_detected'):
+            old_values = (_current_goal(first.get('current_goal'), first['step']) or {}).get(predicate, {})
+            new_values = (_current_goal(current.get('current_goal'), current['step']) or {}).get(predicate, {})
+            if any(value is True and old_values.get(key) is False for key, value in new_values.items()):
+                return True
         for key, old in first.get('metrics', {}).items():
             new = current.get('metrics', {}).get(key)
             if key.startswith('object_to_goal_distance.') and isinstance(old,(int,float)) and isinstance(new,(int,float)) and old-new > 0.02:
@@ -146,7 +191,21 @@ def _progress(frames, agent=None):
             if isinstance(old_distance,(int,float)) and isinstance(new_distance,(int,float)) and old_distance-new_distance > 0.02: return True
             old_flags=(old.get('detection') or {}).get('target_detections') or {}
             new_flags=(new.get('detection') or {}).get('target_detections') or {}
-            if any(value is True and old_flags.get(key) is False for key,value in new_flags.items()): return True
+            if any(value is True and old_flags.get(key) is False
+                   and not _native(current, 'is_detected', key)[0]
+                   and not _native(first, 'is_detected', key)[0]
+                   for key,value in new_flags.items()): return True
+            old_coverage = old.get('goal_coverage') or {}
+            new_coverage = new.get('goal_coverage') or {}
+            if (_fresh(old_coverage, first['step'], 'post_env_step')
+                    and _fresh(new_coverage, current['step'], 'post_env_step')
+                    and old_coverage.get('reference') == new_coverage.get('reference') == 'base_transformation'):
+                for key, target in (new_coverage.get('targets') or {}).items():
+                    before = (old_coverage.get('targets') or {}).get(key, {}).get('distance')
+                    after = target.get('distance')
+                    if (type(before) in (int, float) and type(after) in (int, float)
+                            and math.isfinite(before) and math.isfinite(after) and before-after > 0.02):
+                        return True
     return False
 
 
@@ -273,7 +332,6 @@ class TeamProgressDetector:
         self.team_still_since = self.team_quiet_anchor['step']
         self.frames.append(deepcopy(frame)); self.count += 1
         if len(self.frames) < self.window or (self.count-self.window) % self.check_every: return None
-        if (frame.get('metrics') or {}).get('pddl_success') == 1: return None
         first = self.frames[0]['step']; duration = frame['step'] - first
         unmet = [r for r in assess_goals(frame) if r['satisfied'] is False]
         if not unmet: return None

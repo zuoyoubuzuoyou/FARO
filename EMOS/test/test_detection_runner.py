@@ -45,8 +45,9 @@ def episode():
 
 
 class API:
-    def __init__(self, status="normal", error=False):
-        self.status, self.error, self.requests = status, error, []
+    def __init__(self, system_error=False, error=False, content=None):
+        self.system_error, self.error = system_error, error
+        self.content, self.requests = content, []
         self.chat = SimpleNamespace(completions=self)
         self.base_url = "https://example.invalid"
 
@@ -54,13 +55,10 @@ class API:
         self.requests.append(copy.deepcopy(request))
         if self.error:
             raise TimeoutError("test timeout")
-        recent = json.loads(request["messages"][1]["content"])["recent_frames"]
-        value = {"status": self.status, "reason_code": "test",
-            "explanation": "观察到窗口内的执行情况", "agents": ["agent_0"],
-            "evidence": [{"step": recent[-1]["step"], "observation": "该步等待"}],
-            "confidence": 0.8}
+        content = self.content if self.content is not None else json.dumps(
+            {"system_error": self.system_error})
         return {"choices": [{"finish_reason": "stop", "message": {
-            "content": json.dumps(value), "refusal": None}}],
+            "content": content, "refusal": None}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 5,
                 "total_tokens": 10}}
 
@@ -85,7 +83,7 @@ class DetectionRunnerTest(unittest.TestCase):
 
     def test_llm_positive_stops_only_that_method_and_reuses_request_cache(self):
         runner = load_runner()
-        api = API("system_error")
+        api = API(True)
         config = {"sample_every": 1, "window": 3, "check_every": 1,
             "repeat_threshold": 1, "min_stall_steps": 1}
         with tempfile.TemporaryDirectory() as directory:
@@ -122,15 +120,27 @@ class DetectionRunnerTest(unittest.TestCase):
                 self.assertIsNone(row["detected"])
                 self.assertEqual(row["status"], "partial")
 
-    def test_uncertain_valid_response_counts_as_completed_negative(self):
+    def test_malformed_or_nonboolean_response_keeps_episode_and_scores_partial(self):
         runner = load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.object(runner, "iter_frames", return_value=iter(frame(i) for i in range(4))):
-                row = runner.run_episode(episode(), {"window": 2, "sample_every": 1,
-                    "check_every": 1}, directory, ["llm"], API("uncertain"))[0]
-        self.assertTrue(row["complete"])
-        self.assertFalse(row["detected"])
-        self.assertEqual(row["stats"]["uncertain"], 3)
+        invalid = ("not JSON", '{"system_error": "false"}',
+            '{"system_error": 0}', '{"status": "uncertain"}')
+        label = {"dataset": "batch", "scene_id": "scene", "episode_id": "1",
+            "runtime_system_error": 1, "reviewer": "人工复核"}
+        for content in invalid:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                with patch.object(runner, "iter_frames", return_value=iter(frame(i) for i in range(4))):
+                    result = runner.run_evaluation([episode()], {"window": 2,
+                        "sample_every": 1, "check_every": 1}, directory,
+                        ["llm"], [label], API(content=content))
+                row = result["predictions"][0]
+                self.assertFalse(row["complete"])
+                self.assertIsNone(row["detected"])
+                self.assertEqual(row["status"], "partial")
+                scores = result["metrics"]["batch"]["methods"]["llm"]
+                self.assertEqual(scores["status"], "partial")
+                self.assertEqual(scores["coverage"]["incomplete_predictions"], 1)
+                self.assertEqual((scores["tp"], scores["fp"], scores["fn"], scores["tn"]),
+                    (0, 0, 0, 0))
 
     def test_outputs_keep_success_labels_blank_and_do_not_overwrite_answers(self):
         runner = load_runner()
